@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -38,8 +37,8 @@ class LensScreen extends StatefulWidget {
 class _LensScreenState extends State<LensScreen> {
   CameraController? controller;
   bool isCameraReady = false;
-  bool _isScanning = false;
-  String detectedText = 'Pointe sur un prix...';
+  bool isProcessing = false;
+  String detectedText = 'Pointe sur un prix et appuie sur le bouton';
   double total = 0.0;
   List<ScannedProduct> products = [];
 
@@ -67,67 +66,70 @@ class _LensScreenState extends State<LensScreen> {
     await controller!.initialize();
     if (!mounted) return;
     setState(() => isCameraReady = true);
-    _startLiveScanning();
-  }
-
-  void _startLiveScanning() {
-    controller!.startImageStream((CameraImage image) async {
-      if (_isScanning) return;
-      _isScanning = true;
-
-      try {
-        final WriteBuffer allBytes = WriteBuffer();
-        for (final Plane plane in image.planes) {
-          allBytes.putUint8List(plane.bytes);
-        }
-        final bytes = allBytes.done().buffer.asUint8List();
-
-        final inputImage = InputImage.fromBytes(
-          bytes: bytes,
-          metadata: InputImageMetadata(
-            size: Size(image.width.toDouble(), image.height.toDouble()),
-            rotation: InputImageRotation.rotation0deg,
-            format: InputImageFormat.nv21,
-            bytesPerRow: image.planes[0].bytesPerRow,
-          ),
-        );
-
-        final RecognizedText recognizedText = await textRecognizer.processImage(
-          inputImage,
-        );
-
-        if (recognizedText.text.isNotEmpty) {
-          double? price = _extractPrice(recognizedText.text);
-          if (price != null && mounted) {
-            setState(() {
-              total += price;
-              products.add(
-                ScannedProduct(
-                  label: 'Produit ${products.length + 1}',
-                  price: price,
-                ),
-              );
-              detectedText = '✅ Prix détecté : ${price.toStringAsFixed(2)} €';
-            });
-            await Future.delayed(Duration(seconds: 3));
-          }
-        }
-      } catch (e) {
-        print('Erreur scan live : $e');
-      }
-
-      await Future.delayed(Duration(milliseconds: 500));
-      _isScanning = false;
-    });
   }
 
   double? _extractPrice(String text) {
-    final regex = RegExp(r'\b(\d{1,4}[.,]\d{2})\s*€?\b', caseSensitive: false);
-    final matches = regex.allMatches(text);
-    if (matches.isEmpty) return null;
-    String priceStr = matches.first.group(1)!;
-    priceStr = priceStr.replaceAll(',', '.');
-    return double.tryParse(priceStr);
+    final patterns = [
+      // Format standard : 1.25 ou 1,25
+      RegExp(r'\b(\d{1,4})[.,](\d{2})\s*€?\b'),
+      // Format avec € : 1€25
+      RegExp(r'\b(\d{1,4})\s*€\s*(\d{2})\b'),
+      // Format sans séparateur : 125 lu comme 1.25
+      RegExp(r'\b([1-9])(\d{2})\b'),
+    ];
+
+    for (final regex in patterns) {
+      final matches = regex.allMatches(text);
+      for (final match in matches) {
+        String euros = match.group(1)!;
+        String cents = match.group(2)!;
+        double? price = double.tryParse('$euros.$cents');
+        if (price != null && price > 0 && price < 100) {
+          return price;
+        }
+      }
+    }
+    return null;
+  }
+
+  Future<void> _scanPrice() async {
+    if (controller == null || isProcessing) return;
+
+    setState(() {
+      isProcessing = true;
+      detectedText = 'Scan en cours...';
+    });
+
+    try {
+      final image = await controller!.takePicture();
+      final inputImage = InputImage.fromFilePath(image.path);
+      final RecognizedText recognizedText = await textRecognizer.processImage(
+        inputImage,
+      );
+
+      double? price = _extractPrice(recognizedText.text);
+
+      if (price != null) {
+        setState(() {
+          total += price;
+          products.add(
+            ScannedProduct(
+              label: 'Produit ${products.length + 1}',
+              price: price,
+            ),
+          );
+          detectedText = '✅ ${price.toStringAsFixed(2)} € ajouté !';
+        });
+      } else {
+        setState(() {
+          detectedText = 'Prix non détecté — réessaie';
+        });
+      }
+    } catch (e) {
+      setState(() => detectedText = 'Erreur : $e');
+    }
+
+    setState(() => isProcessing = false);
   }
 
   void _removeProduct(int index) {
@@ -141,7 +143,7 @@ class _LensScreenState extends State<LensScreen> {
     setState(() {
       total = 0.0;
       products.clear();
-      detectedText = 'Pointe sur un prix...';
+      detectedText = 'Pointe sur un prix et appuie sur le bouton';
     });
   }
 
@@ -168,8 +170,8 @@ class _LensScreenState extends State<LensScreen> {
           Container(color: Colors.black.withOpacity(0.3)),
           Center(
             child: Container(
-              width: 280,
-              height: 160,
+              width: 300,
+              height: 180,
               decoration: BoxDecoration(
                 border: Border.all(color: Colors.blue, width: 2),
                 borderRadius: BorderRadius.circular(12),
@@ -181,7 +183,7 @@ class _LensScreenState extends State<LensScreen> {
             left: 0,
             right: 0,
             child: Container(
-              constraints: BoxConstraints(maxHeight: 320),
+              constraints: BoxConstraints(maxHeight: 350),
               decoration: BoxDecoration(
                 color: Colors.black.withOpacity(0.85),
                 borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
@@ -190,16 +192,18 @@ class _LensScreenState extends State<LensScreen> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Padding(
-                    padding: EdgeInsets.all(12),
+                    padding: EdgeInsets.fromLTRB(12, 12, 12, 4),
                     child: Text(
                       detectedText,
-                      style: TextStyle(color: Colors.white, fontSize: 13),
+                      style: TextStyle(color: Colors.white, fontSize: 12),
                       textAlign: TextAlign.center,
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ),
                   if (products.isNotEmpty)
                     SizedBox(
-                      height: 120,
+                      height: 100,
                       child: ListView.builder(
                         itemCount: products.length,
                         itemBuilder: (context, index) {
@@ -210,7 +214,7 @@ class _LensScreenState extends State<LensScreen> {
                               p.label,
                               style: TextStyle(
                                 color: Colors.white,
-                                fontSize: 13,
+                                fontSize: 12,
                               ),
                             ),
                             trailing: Row(
@@ -221,13 +225,14 @@ class _LensScreenState extends State<LensScreen> {
                                   style: TextStyle(
                                     color: Colors.blue,
                                     fontWeight: FontWeight.bold,
+                                    fontSize: 13,
                                   ),
                                 ),
                                 IconButton(
                                   icon: Icon(
                                     Icons.delete,
                                     color: Colors.red,
-                                    size: 18,
+                                    size: 16,
                                   ),
                                   onPressed: () => _removeProduct(index),
                                 ),
@@ -238,8 +243,8 @@ class _LensScreenState extends State<LensScreen> {
                       ),
                     ),
                   Container(
-                    margin: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                    padding: EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+                    margin: EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                    padding: EdgeInsets.symmetric(horizontal: 20, vertical: 10),
                     decoration: BoxDecoration(
                       color: Colors.blue.withOpacity(0.2),
                       borderRadius: BorderRadius.circular(30),
@@ -268,7 +273,7 @@ class _LensScreenState extends State<LensScreen> {
                     ),
                   ),
                   Padding(
-                    padding: EdgeInsets.only(bottom: 16),
+                    padding: EdgeInsets.only(bottom: 16, top: 4),
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
@@ -278,7 +283,7 @@ class _LensScreenState extends State<LensScreen> {
                             child: Container(
                               width: 48,
                               height: 48,
-                              margin: EdgeInsets.only(right: 20),
+                              margin: EdgeInsets.only(right: 24),
                               decoration: BoxDecoration(
                                 shape: BoxShape.circle,
                                 border: Border.all(color: Colors.red, width: 2),
@@ -287,47 +292,28 @@ class _LensScreenState extends State<LensScreen> {
                             ),
                           ),
                         GestureDetector(
-                          onTap: () async {
-                            if (controller == null) return;
-                            try {
-                              final image = await controller!.takePicture();
-                              final inputImage = InputImage.fromFilePath(
-                                image.path,
-                              );
-                              final RecognizedText recognizedText =
-                                  await textRecognizer.processImage(inputImage);
-                              double? price = _extractPrice(
-                                recognizedText.text,
-                              );
-                              if (price != null) {
-                                setState(() {
-                                  total += price;
-                                  products.add(
-                                    ScannedProduct(
-                                      label: 'Produit ${products.length + 1}',
-                                      price: price,
-                                    ),
-                                  );
-                                  detectedText =
-                                      '✅ Prix : ${price.toStringAsFixed(2)} €';
-                                });
-                              } else {
-                                setState(
-                                  () => detectedText = 'Pas de prix trouvé',
-                                );
-                              }
-                            } catch (e) {
-                              setState(() => detectedText = 'Erreur : $e');
-                            }
-                          },
+                          onTap: _scanPrice,
                           child: Container(
-                            width: 70,
-                            height: 70,
+                            width: 72,
+                            height: 72,
                             decoration: BoxDecoration(
                               shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white, width: 4),
+                              color: isProcessing ? Colors.grey : Colors.blue,
+                              border: Border.all(color: Colors.white, width: 3),
                             ),
-                            child: Icon(Icons.camera_alt, color: Colors.white),
+                            child: isProcessing
+                                ? Padding(
+                                    padding: EdgeInsets.all(14),
+                                    child: CircularProgressIndicator(
+                                      color: Colors.white,
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : Icon(
+                                    Icons.camera_alt,
+                                    color: Colors.white,
+                                    size: 32,
+                                  ),
                           ),
                         ),
                       ],
