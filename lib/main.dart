@@ -1,10 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_litert/flutter_litert.dart';
-import 'dart:typed_data';
 import 'dart:io';
 import 'package:image/image.dart' as img;
 
@@ -31,7 +29,12 @@ class BudgetscanApp extends StatelessWidget {
 class ScannedProduct {
   final String label;
   final double price;
-  ScannedProduct({required this.label, required this.price});
+  final String imagePath;
+  ScannedProduct({
+    required this.label,
+    required this.price,
+    required this.imagePath,
+  });
 }
 
 class LensScreen extends StatefulWidget {
@@ -43,10 +46,12 @@ class _LensScreenState extends State<LensScreen> {
   CameraController? controller;
   bool isCameraReady = false;
   bool isProcessing = false;
+  bool flashOn = false;
   String detectedText = 'Pointe sur un prix et appuie sur le bouton';
   double total = 0.0;
   List<ScannedProduct> products = [];
   Interpreter? _interpreter;
+  String? lastImagePath;
 
   final TextRecognizer textRecognizer = TextRecognizer(
     script: TextRecognitionScript.latin,
@@ -59,7 +64,6 @@ class _LensScreenState extends State<LensScreen> {
     _loadModel();
   }
 
-  // Charge le modèle YOLO TFLite depuis les assets
   Future<void> _loadModel() async {
     try {
       _interpreter = await Interpreter.fromAsset(
@@ -79,7 +83,7 @@ class _LensScreenState extends State<LensScreen> {
     }
     controller = CameraController(
       cameras[0],
-      ResolutionPreset.high,
+      ResolutionPreset.medium, // ✅ Réduit pour plus de vitesse
       enableAudio: false,
     );
     await controller!.initialize();
@@ -87,10 +91,15 @@ class _LensScreenState extends State<LensScreen> {
     setState(() => isCameraReady = true);
   }
 
-  // Prépare l'image pour YOLO : redimensionne en 640x640 avec letterbox
+  Future<void> _toggleFlash() async {
+    if (controller == null) return;
+    setState(() => flashOn = !flashOn);
+    await controller!.setFlashMode(flashOn ? FlashMode.torch : FlashMode.off);
+  }
+
   List<List<List<List<double>>>> _prepareImage(img.Image image) {
     final resized = img.copyResize(image, width: 640, height: 640);
-    final input = List.generate(
+    return List.generate(
       1,
       (_) => List.generate(
         640,
@@ -100,39 +109,29 @@ class _LensScreenState extends State<LensScreen> {
         }),
       ),
     );
-    return input;
   }
 
-  // Détecte l'étiquette de prix avec YOLO et retourne la bbox
   Map<String, double>? _detectPriceTag(img.Image image) {
     if (_interpreter == null) return null;
-
     final input = _prepareImage(image);
     final output = List.generate(
       1,
       (_) => List.generate(5, (_) => List.filled(8400, 0.0)),
     );
-
     _interpreter!.run(input, output);
 
-    // Trouve la détection avec la plus haute confiance
-    double bestConf = 0.3; // seuil minimum
+    double bestConf = 0.3;
     int bestIdx = -1;
-
     for (int i = 0; i < 8400; i++) {
-      final conf = output[0][4][i];
-      if (conf > bestConf) {
-        bestConf = conf;
+      if (output[0][4][i] > bestConf) {
+        bestConf = output[0][4][i];
         bestIdx = i;
       }
     }
-
     if (bestIdx == -1) return null;
 
-    // Coordonnées normalisées → pixels sur l'image originale
     final imgW = image.width.toDouble();
     final imgH = image.height.toDouble();
-
     final xc = output[0][0][bestIdx] / 640 * imgW;
     final yc = output[0][1][bestIdx] / 640 * imgH;
     final w = output[0][2][bestIdx] / 640 * imgW;
@@ -147,60 +146,53 @@ class _LensScreenState extends State<LensScreen> {
     };
   }
 
-  // Regex améliorée validée à 100% sur 393 prix réels
+  // ✅ Regex corrigée - prend le plus petit prix en cas de promo
   double? _extractPrice(String text) {
     final patterns = [
-      // Format 2 décimales : 1.25, 1,25
       RegExp(r'\b(\d{1,4})[.,](\d{2})\s*€?\b'),
-      // Format 1 décimale : 59.5, 34.9, 1,7
       RegExp(r'\b(\d{1,4})[.,](\d{1})\s*€?\b'),
-      // Format avec € : 1€25
       RegExp(r'\b(\d{1,4})\s*€\s*(\d{2})\b'),
-      // Prix entier : 120, 2, 1
-      RegExp(r'\b(\d{1,4})\b'),
+      RegExp(r'\b([1-9])(\d{2})\b'),
+      RegExp(r'\b(\d{1,3})\b'),
     ];
 
+    List<double> prices = [];
+
     for (final regex in patterns) {
-      final match = regex.firstMatch(text);
-      if (match != null) {
+      for (final match in regex.allMatches(text)) {
         String euros = match.group(1)!;
         String cents = match.groupCount >= 2 && match.group(2) != null
             ? match.group(2)!
             : '0';
         double? price = double.tryParse('$euros.$cents');
         if (price != null && price > 0 && price < 1000) {
-          return price;
+          prices.add(price);
         }
       }
+      if (prices.isNotEmpty) break;
     }
-    return null;
+
+    if (prices.isEmpty) return null;
+    // ✅ Prend le plus petit prix — en cas de promo c'est le bon
+    return prices.reduce((a, b) => a < b ? a : b);
   }
 
   Future<void> _scanPrice() async {
     if (controller == null || isProcessing) return;
-
     setState(() {
       isProcessing = true;
       detectedText = 'Scan en cours...';
     });
 
     try {
-      // 1. Prend la photo
       final imageFile = await controller!.takePicture();
       final imageBytes = await File(imageFile.path).readAsBytes();
       final image = img.decodeImage(imageBytes)!;
-
       String scanPath = imageFile.path;
 
-      // 2. YOLO détecte l'étiquette de prix
       if (_interpreter != null) {
         final bbox = _detectPriceTag(image);
         if (bbox != null) {
-          print(
-            '✅ YOLO détecte avec confiance ${bbox['conf']!.toStringAsFixed(2)}',
-          );
-
-          // 3. Crop la zone détectée avec une marge de 10px
           final margin = 10.0;
           final x1 = (bbox['x1']! - margin)
               .clamp(0, image.width.toDouble())
@@ -215,23 +207,28 @@ class _LensScreenState extends State<LensScreen> {
               .clamp(0, image.height.toDouble())
               .toInt();
 
-          final cropped = img.copyCrop(
-            image,
-            x: x1,
-            y: y1,
-            width: x2 - x1,
-            height: y2 - y1,
-          );
+          final cropWidth = x2 - x1;
+          final cropHeight = y2 - y1;
 
-          // Sauvegarde le crop pour l'OCR
-          final cropPath = imageFile.path.replaceAll('.jpg', '_crop.jpg');
-          await File(cropPath).writeAsBytes(img.encodeJpg(cropped));
-          scanPath = cropPath;
-
-          setState(
-            () => detectedText =
-                'Étiquette trouvée (${(bbox['conf']! * 100).toInt()}%) — lecture...',
-          );
+          // ✅ Fix crop trop petit
+          if (cropWidth >= 32 && cropHeight >= 32) {
+            final cropped = img.copyCrop(
+              image,
+              x: x1,
+              y: y1,
+              width: cropWidth,
+              height: cropHeight,
+            );
+            final cropPath = imageFile.path.replaceAll('.jpg', '_crop.jpg');
+            await File(cropPath).writeAsBytes(img.encodeJpg(cropped));
+            scanPath = cropPath;
+            setState(
+              () => detectedText =
+                  'Étiquette trouvée (${(bbox['conf']! * 100).toInt()}%) — lecture...',
+            );
+          } else {
+            setState(() => detectedText = 'Zone trop petite — OCR direct...');
+          }
         } else {
           setState(
             () => detectedText = 'Étiquette non trouvée — OCR direct...',
@@ -239,22 +236,21 @@ class _LensScreenState extends State<LensScreen> {
         }
       }
 
-      // 4. OCR sur la zone cropée (ou image entière si pas de détection)
       final inputImage = InputImage.fromFilePath(scanPath);
       final RecognizedText recognizedText = await textRecognizer.processImage(
         inputImage,
       );
-
-      // 5. Extraction du prix
       double? price = _extractPrice(recognizedText.text);
 
       if (price != null) {
         setState(() {
           total += price;
+          lastImagePath = imageFile.path;
           products.add(
             ScannedProduct(
               label: 'Produit ${products.length + 1}',
               price: price,
+              imagePath: imageFile.path,
             ),
           );
           detectedText = '✅ ${price.toStringAsFixed(2)} € ajouté !';
@@ -265,14 +261,15 @@ class _LensScreenState extends State<LensScreen> {
     } catch (e) {
       setState(() => detectedText = 'Erreur : $e');
     }
-
     setState(() => isProcessing = false);
   }
 
   void _removeProduct(int index) {
     setState(() {
       total -= products[index].price;
+      if (products[index].imagePath == lastImagePath) lastImagePath = null;
       products.removeAt(index);
+      if (products.isNotEmpty) lastImagePath = products.last.imagePath;
     });
   }
 
@@ -280,8 +277,141 @@ class _LensScreenState extends State<LensScreen> {
     setState(() {
       total = 0.0;
       products.clear();
+      lastImagePath = null;
       detectedText = 'Pointe sur un prix et appuie sur le bouton';
     });
+  }
+
+  void _showHistory() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.grey[900],
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => Column(
+        children: [
+          Padding(
+            padding: EdgeInsets.all(16),
+            child: Text(
+              'Historique de la session',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 16,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+          Expanded(
+            child: products.isEmpty
+                ? Center(
+                    child: Text(
+                      'Aucun scan cette session',
+                      style: TextStyle(color: Colors.grey),
+                    ),
+                  )
+                : ListView.builder(
+                    itemCount: products.length,
+                    itemBuilder: (context, index) {
+                      final p = products[index];
+                      return ListTile(
+                        leading: File(p.imagePath).existsSync()
+                            ? ClipRRect(
+                                borderRadius: BorderRadius.circular(8),
+                                child: Image.file(
+                                  File(p.imagePath),
+                                  width: 50,
+                                  height: 50,
+                                  fit: BoxFit.cover,
+                                ),
+                              )
+                            : Icon(Icons.image, color: Colors.grey),
+                        title: Text(
+                          p.label,
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        trailing: Text(
+                          '${p.price.toStringAsFixed(2)} €',
+                          style: TextStyle(
+                            color: Colors.blue,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showMenu(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.grey[900],
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            leading: Icon(Icons.info_outline, color: Colors.blue),
+            title: Text('À propos', style: TextStyle(color: Colors.white)),
+            onTap: () {
+              Navigator.pop(context);
+              _showPage(
+                'À propos',
+                'BudgetScan est une application de scan de prix privacy-first. Aucune donnée collectée, aucun compte requis.',
+              );
+            },
+          ),
+          ListTile(
+            leading: Icon(Icons.gavel, color: Colors.blue),
+            title: Text(
+              "Conditions d'utilisation",
+              style: TextStyle(color: Colors.white),
+            ),
+            onTap: () {
+              Navigator.pop(context);
+              _showPage(
+                "Conditions d'utilisation",
+                'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.',
+              );
+            },
+          ),
+          ListTile(
+            leading: Icon(Icons.mail_outline, color: Colors.blue),
+            title: Text('Contact', style: TextStyle(color: Colors.white)),
+            onTap: () {
+              Navigator.pop(context);
+              _showPage(
+                'Contact',
+                'Pour nous contacter : contact@weboara.fr\n\nLorem ipsum dolor sit amet.',
+              );
+            },
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showPage(String title, String content) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: Colors.grey[900],
+        title: Text(title, style: TextStyle(color: Colors.white)),
+        content: Text(content, style: TextStyle(color: Colors.grey[300])),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text('Fermer', style: TextStyle(color: Colors.blue)),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -306,6 +436,65 @@ class _LensScreenState extends State<LensScreen> {
         children: [
           CameraPreview(controller!),
           Container(color: Colors.black.withOpacity(0.3)),
+
+          // 🔝 Header
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: SafeArea(
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    GestureDetector(
+                      onTap: _toggleFlash,
+                      child: Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.5),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          flashOn ? Icons.flash_on : Icons.flash_off,
+                          color: flashOn ? Colors.yellow : Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                    Text(
+                      'BudgetScan',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: () => _showMenu(context),
+                      child: Container(
+                        width: 40,
+                        height: 40,
+                        decoration: BoxDecoration(
+                          color: Colors.black.withOpacity(0.5),
+                          shape: BoxShape.circle,
+                        ),
+                        child: Icon(
+                          Icons.more_vert,
+                          color: Colors.white,
+                          size: 20,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // 🔳 Cadre de scan
           Center(
             child: Container(
               width: 300,
@@ -316,6 +505,8 @@ class _LensScreenState extends State<LensScreen> {
               ),
             ),
           ),
+
+          // 📋 Panel bas
           Positioned(
             bottom: 0,
             left: 0,
@@ -415,20 +606,33 @@ class _LensScreenState extends State<LensScreen> {
                     child: Row(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        if (products.isNotEmpty)
-                          GestureDetector(
-                            onTap: _resetAll,
-                            child: Container(
-                              width: 48,
-                              height: 48,
-                              margin: EdgeInsets.only(right: 24),
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                border: Border.all(color: Colors.red, width: 2),
-                              ),
-                              child: Icon(Icons.refresh, color: Colors.red),
+                        GestureDetector(
+                          onTap: _showHistory,
+                          child: Container(
+                            width: 48,
+                            height: 48,
+                            margin: EdgeInsets.only(right: 24),
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              border: Border.all(color: Colors.white, width: 2),
+                              color: Colors.grey[800],
                             ),
+                            child:
+                                lastImagePath != null &&
+                                    File(lastImagePath!).existsSync()
+                                ? ClipOval(
+                                    child: Image.file(
+                                      File(lastImagePath!),
+                                      fit: BoxFit.cover,
+                                    ),
+                                  )
+                                : Icon(
+                                    Icons.history,
+                                    color: Colors.white,
+                                    size: 22,
+                                  ),
                           ),
+                        ),
                         GestureDetector(
                           onTap: _scanPrice,
                           child: Container(
@@ -454,6 +658,20 @@ class _LensScreenState extends State<LensScreen> {
                                   ),
                           ),
                         ),
+                        if (products.isNotEmpty)
+                          GestureDetector(
+                            onTap: _resetAll,
+                            child: Container(
+                              width: 48,
+                              height: 48,
+                              margin: EdgeInsets.only(left: 24),
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                border: Border.all(color: Colors.red, width: 2),
+                              ),
+                              child: Icon(Icons.refresh, color: Colors.red),
+                            ),
+                          ),
                       ],
                     ),
                   ),
