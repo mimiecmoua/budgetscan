@@ -15,6 +15,7 @@ dependencies:
   permission_handler: ^11.3.1
   flutter_litert: ^3.2.1
   image: ^4.9.1
+  wakelock_plus: ^1.6.1
 dev_dependencies:
   flutter_test:
     sdk: flutter

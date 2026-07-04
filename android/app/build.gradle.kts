@@ -21,6 +21,10 @@ android {
         versionName = flutter.versionName
     }
 
+    androidResources {
+        noCompress += listOf("tflite")
+    }
+
     buildTypes {
         release {
             signingConfig = signingConfigs.getByName("debug")

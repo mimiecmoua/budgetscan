@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_litert/flutter_litert.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
 import 'dart:io';
 import 'package:image/image.dart' as img;
 
@@ -53,6 +55,9 @@ class _LensScreenState extends State<LensScreen> {
   Interpreter? _interpreter;
   String? lastImagePath;
 
+  static const double scanBoxWidth = 300;
+  static const double scanBoxHeight = 180;
+
   final TextRecognizer textRecognizer = TextRecognizer(
     script: TextRecognitionScript.latin,
   );
@@ -60,6 +65,7 @@ class _LensScreenState extends State<LensScreen> {
   @override
   void initState() {
     super.initState();
+    WakelockPlus.enable();
     _initCamera();
     _loadModel();
   }
@@ -83,7 +89,7 @@ class _LensScreenState extends State<LensScreen> {
     }
     controller = CameraController(
       cameras[0],
-      ResolutionPreset.medium, // ✅ Réduit pour plus de vitesse
+      ResolutionPreset.medium,
       enableAudio: false,
     );
     await controller!.initialize();
@@ -111,6 +117,7 @@ class _LensScreenState extends State<LensScreen> {
     );
   }
 
+  // ✅ YOLO détecte l'étiquette sur image entière
   Map<String, double>? _detectPriceTag(img.Image image) {
     if (_interpreter == null) return null;
     final input = _prepareImage(image);
@@ -137,6 +144,8 @@ class _LensScreenState extends State<LensScreen> {
     final w = output[0][2][bestIdx] / 640 * imgW;
     final h = output[0][3][bestIdx] / 640 * imgH;
 
+    print('✅ YOLO confiance: $bestConf');
+
     return {
       'x1': (xc - w / 2).clamp(0, imgW),
       'y1': (yc - h / 2).clamp(0, imgH),
@@ -146,20 +155,33 @@ class _LensScreenState extends State<LensScreen> {
     };
   }
 
-  // ✅ Regex corrigée - prend le plus petit prix en cas de promo
   double? _extractPrice(String text) {
+    String normalized = text
+        .replaceAll('⁰', '0')
+        .replaceAll('¹', '1')
+        .replaceAll('²', '2')
+        .replaceAll('³', '3')
+        .replaceAll('⁴', '4')
+        .replaceAll('⁵', '5')
+        .replaceAll('⁶', '6')
+        .replaceAll('⁷', '7')
+        .replaceAll('⁸', '8')
+        .replaceAll('⁹', '9')
+        .replaceAll('EUR', '')
+        .replaceAll('euro', '');
+
     final patterns = [
       RegExp(r'\b(\d{1,4})[.,](\d{2})\s*€?\b'),
       RegExp(r'\b(\d{1,4})[.,](\d{1})\s*€?\b'),
       RegExp(r'\b(\d{1,4})\s*€\s*(\d{2})\b'),
+      RegExp(r'\b(\d)\s+(\d{2})\s*€?\b'),
       RegExp(r'\b([1-9])(\d{2})\b'),
       RegExp(r'\b(\d{1,3})\b'),
     ];
 
     List<double> prices = [];
-
     for (final regex in patterns) {
-      for (final match in regex.allMatches(text)) {
+      for (final match in regex.allMatches(normalized)) {
         String euros = match.group(1)!;
         String cents = match.groupCount >= 2 && match.group(2) != null
             ? match.group(2)!
@@ -173,7 +195,6 @@ class _LensScreenState extends State<LensScreen> {
     }
 
     if (prices.isEmpty) return null;
-    // ✅ Prend le plus petit prix — en cas de promo c'est le bon
     return prices.reduce((a, b) => a < b ? a : b);
   }
 
@@ -187,33 +208,33 @@ class _LensScreenState extends State<LensScreen> {
     try {
       final imageFile = await controller!.takePicture();
       final imageBytes = await File(imageFile.path).readAsBytes();
-      final image = img.decodeImage(imageBytes)!;
+      final fullImage = img.decodeImage(imageBytes)!;
       String scanPath = imageFile.path;
 
+      // ✅ YOLO sur image entière — pas de crop manuel
       if (_interpreter != null) {
-        final bbox = _detectPriceTag(image);
+        final bbox = _detectPriceTag(fullImage);
         if (bbox != null) {
-          final margin = 10.0;
+          final margin = 20.0;
           final x1 = (bbox['x1']! - margin)
-              .clamp(0, image.width.toDouble())
+              .clamp(0, fullImage.width.toDouble())
               .toInt();
           final y1 = (bbox['y1']! - margin)
-              .clamp(0, image.height.toDouble())
+              .clamp(0, fullImage.height.toDouble())
               .toInt();
           final x2 = (bbox['x2']! + margin)
-              .clamp(0, image.width.toDouble())
+              .clamp(0, fullImage.width.toDouble())
               .toInt();
           final y2 = (bbox['y2']! + margin)
-              .clamp(0, image.height.toDouble())
+              .clamp(0, fullImage.height.toDouble())
               .toInt();
 
           final cropWidth = x2 - x1;
           final cropHeight = y2 - y1;
 
-          // ✅ Fix crop trop petit
           if (cropWidth >= 32 && cropHeight >= 32) {
             final cropped = img.copyCrop(
-              image,
+              fullImage,
               x: x1,
               y: y1,
               width: cropWidth,
@@ -227,7 +248,9 @@ class _LensScreenState extends State<LensScreen> {
                   'Étiquette trouvée (${(bbox['conf']! * 100).toInt()}%) — lecture...',
             );
           } else {
-            setState(() => detectedText = 'Zone trop petite — OCR direct...');
+            setState(
+              () => detectedText = 'Zone détectée trop petite — OCR direct...',
+            );
           }
         } else {
           setState(
@@ -236,6 +259,7 @@ class _LensScreenState extends State<LensScreen> {
         }
       }
 
+      // ✅ OCR sur la zone YOLO ou image entière
       final inputImage = InputImage.fromFilePath(scanPath);
       final RecognizedText recognizedText = await textRecognizer.processImage(
         inputImage,
@@ -243,6 +267,7 @@ class _LensScreenState extends State<LensScreen> {
       double? price = _extractPrice(recognizedText.text);
 
       if (price != null) {
+        HapticFeedback.mediumImpact();
         setState(() {
           total += price;
           lastImagePath = imageFile.path;
@@ -256,6 +281,7 @@ class _LensScreenState extends State<LensScreen> {
           detectedText = '✅ ${price.toStringAsFixed(2)} € ajouté !';
         });
       } else {
+        HapticFeedback.lightImpact();
         setState(() => detectedText = 'Prix non détecté — réessaie');
       }
     } catch (e) {
@@ -377,7 +403,7 @@ class _LensScreenState extends State<LensScreen> {
               Navigator.pop(context);
               _showPage(
                 "Conditions d'utilisation",
-                'Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.',
+                'Lorem ipsum dolor sit amet, consectetur adipiscing elit.',
               );
             },
           ),
@@ -386,10 +412,7 @@ class _LensScreenState extends State<LensScreen> {
             title: Text('Contact', style: TextStyle(color: Colors.white)),
             onTap: () {
               Navigator.pop(context);
-              _showPage(
-                'Contact',
-                'Pour nous contacter : contact@weboara.fr\n\nLorem ipsum dolor sit amet.',
-              );
+              _showPage('Contact', 'Pour nous contacter : contact@weboara.fr');
             },
           ),
         ],
@@ -416,6 +439,7 @@ class _LensScreenState extends State<LensScreen> {
 
   @override
   void dispose() {
+    WakelockPlus.disable();
     controller?.dispose();
     textRecognizer.close();
     _interpreter?.close();
@@ -494,11 +518,11 @@ class _LensScreenState extends State<LensScreen> {
             ),
           ),
 
-          // 🔳 Cadre de scan
+          // 🔳 Cadre de scan (guide visuel)
           Center(
             child: Container(
-              width: 300,
-              height: 180,
+              width: scanBoxWidth,
+              height: scanBoxHeight,
               decoration: BoxDecoration(
                 border: Border.all(color: Colors.blue, width: 2),
                 borderRadius: BorderRadius.circular(12),
