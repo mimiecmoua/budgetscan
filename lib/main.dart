@@ -3,7 +3,6 @@ import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:flutter_litert/flutter_litert.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'dart:io';
 import 'package:image/image.dart' as img;
@@ -52,8 +51,10 @@ class _LensScreenState extends State<LensScreen> {
   String detectedText = 'Pointe sur un prix et appuie sur le bouton';
   double total = 0.0;
   List<ScannedProduct> products = [];
-  Interpreter? _interpreter;
   String? lastImagePath;
+
+  // ✅ GlobalKey pour position exacte du rectangle bleu
+  final GlobalKey _scanBoxKey = GlobalKey();
 
   static const double scanBoxWidth = 300;
   static const double scanBoxHeight = 180;
@@ -67,18 +68,6 @@ class _LensScreenState extends State<LensScreen> {
     super.initState();
     WakelockPlus.enable();
     _initCamera();
-    _loadModel();
-  }
-
-  Future<void> _loadModel() async {
-    try {
-      _interpreter = await Interpreter.fromAsset(
-        'assets/ml/best_float32.tflite',
-      );
-      print('✅ Modèle YOLO chargé');
-    } catch (e) {
-      print('❌ Erreur chargement YOLO : $e');
-    }
   }
 
   Future<void> _initCamera() async {
@@ -103,56 +92,74 @@ class _LensScreenState extends State<LensScreen> {
     await controller!.setFlashMode(flashOn ? FlashMode.torch : FlashMode.off);
   }
 
-  List<List<List<List<double>>>> _prepareImage(img.Image image) {
-    final resized = img.copyResize(image, width: 640, height: 640);
-    return List.generate(
-      1,
-      (_) => List.generate(
-        640,
-        (y) => List.generate(640, (x) {
-          final pixel = resized.getPixel(x, y);
-          return [pixel.r / 255.0, pixel.g / 255.0, pixel.b / 255.0];
-        }),
-      ),
-    );
+  // ✅ Crop universel via GlobalKey
+  img.Image? _cropScanBox(img.Image fullImage) {
+    try {
+      final RenderBox box =
+          _scanBoxKey.currentContext!.findRenderObject() as RenderBox;
+      final Offset topLeft = box.localToGlobal(Offset.zero);
+      final Size boxSize = box.size;
+      final screenSize = MediaQuery.of(_scanBoxKey.currentContext!).size;
+
+      final scaleX = fullImage.width / screenSize.width;
+      final scaleY = fullImage.height / screenSize.height;
+
+      final x1 = (topLeft.dx * scaleX).toInt().clamp(0, fullImage.width);
+      final y1 = ((topLeft.dy + 80) * scaleY).toInt().clamp(
+        0,
+        fullImage.height,
+      );
+      final x2 = ((topLeft.dx + boxSize.width) * scaleX).toInt().clamp(
+        0,
+        fullImage.width,
+      );
+      final y2 = ((topLeft.dy + boxSize.height + 80) * scaleY).toInt().clamp(
+        0,
+        fullImage.height,
+      );
+
+      print(
+        '✂️ Crop: ($x1,$y1) → ($x2,$y2) sur ${fullImage.width}x${fullImage.height}',
+      );
+
+      return img.copyCrop(
+        fullImage,
+        x: x1,
+        y: y1,
+        width: (x2 - x1).clamp(32, fullImage.width),
+        height: (y2 - y1).clamp(32, fullImage.height),
+      );
+    } catch (e) {
+      print('❌ Erreur crop: $e');
+      return null;
+    }
   }
 
-  // ✅ YOLO détecte l'étiquette sur image entière
-  Map<String, double>? _detectPriceTag(img.Image image) {
-    if (_interpreter == null) return null;
-    final input = _prepareImage(image);
-    final output = List.generate(
-      1,
-      (_) => List.generate(5, (_) => List.filled(8400, 0.0)),
-    );
-    _interpreter!.run(input, output);
+  // ✅ Tri spatial des blocs — euros à gauche, centimes à droite
+  double? _extractPriceFromBlocks(RecognizedText recognizedText) {
+    // Trie les blocs par position horizontale (gauche → droite)
+    List<TextBlock> blocks = recognizedText.blocks
+        .where((b) => b.boundingBox != null)
+        .toList();
 
-    double bestConf = 0.3;
-    int bestIdx = -1;
-    for (int i = 0; i < 8400; i++) {
-      if (output[0][4][i] > bestConf) {
-        bestConf = output[0][4][i];
-        bestIdx = i;
+    blocks.sort((a, b) => a.boundingBox!.left.compareTo(b.boundingBox!.left));
+
+    // Cherche le prix dans chaque bloc du plus grand au plus petit
+    List<MapEntry<TextBlock, double>> blocksWithSize = blocks
+        .map((b) => MapEntry(b, b.boundingBox!.width * b.boundingBox!.height))
+        .toList();
+    blocksWithSize.sort((a, b) => b.value.compareTo(a.value));
+
+    for (final entry in blocksWithSize) {
+      final price = _extractPrice(entry.key.text);
+      if (price != null) {
+        print('💰 Prix: ${entry.key.text} → $price');
+        return price;
       }
     }
-    if (bestIdx == -1) return null;
 
-    final imgW = image.width.toDouble();
-    final imgH = image.height.toDouble();
-    final xc = output[0][0][bestIdx] / 640 * imgW;
-    final yc = output[0][1][bestIdx] / 640 * imgH;
-    final w = output[0][2][bestIdx] / 640 * imgW;
-    final h = output[0][3][bestIdx] / 640 * imgH;
-
-    print('✅ YOLO confiance: $bestConf');
-
-    return {
-      'x1': (xc - w / 2).clamp(0, imgW),
-      'y1': (yc - h / 2).clamp(0, imgH),
-      'x2': (xc + w / 2).clamp(0, imgW),
-      'y2': (yc + h / 2).clamp(0, imgH),
-      'conf': bestConf,
-    };
+    // Fallback — texte complet
+    return _extractPrice(recognizedText.text);
   }
 
   double? _extractPrice(String text) {
@@ -168,14 +175,25 @@ class _LensScreenState extends State<LensScreen> {
         .replaceAll('⁸', '8')
         .replaceAll('⁹', '9')
         .replaceAll('EUR', '')
-        .replaceAll('euro', '');
+        .replaceAll('euro', '')
+        .replaceAll('€/u', '')
+        .replaceAll('€/l', '')
+        .replaceAll('€/kg', '');
 
     final patterns = [
+      // Format standard : 1.25, 1,25
       RegExp(r'\b(\d{1,4})[.,](\d{2})\s*€?\b'),
+      // Format 1 décimale : 59.5
       RegExp(r'\b(\d{1,4})[.,](\d{1})\s*€?\b'),
-      RegExp(r'\b(\d{1,4})\s*€\s*(\d{2})\b'),
+      // Format € entre : 1€45
+      RegExp(r'\b(\d{1,4})\s*[€e]\s*(\d{2})\b'),
+      // Format avec saut de ligne : "1\n45"
+      RegExp(r'(\d{1,2})\n(\d{2})\s*€?'),
+      // Format exposant séparé : "0 75"
       RegExp(r'\b(\d)\s+(\d{2})\s*€?\b'),
+      // Format sans séparateur : 125 → 1.25
       RegExp(r'\b([1-9])(\d{2})\b'),
+      // Prix entier
       RegExp(r'\b(\d{1,3})\b'),
     ];
 
@@ -195,6 +213,7 @@ class _LensScreenState extends State<LensScreen> {
     }
 
     if (prices.isEmpty) return null;
+    // Prend le plus petit — en cas de promo c'est le bon
     return prices.reduce((a, b) => a < b ? a : b);
   }
 
@@ -209,62 +228,27 @@ class _LensScreenState extends State<LensScreen> {
       final imageFile = await controller!.takePicture();
       final imageBytes = await File(imageFile.path).readAsBytes();
       final fullImage = img.decodeImage(imageBytes)!;
+
+      // ✅ Crop du rectangle bleu via GlobalKey
+      final boxCrop = _cropScanBox(fullImage);
       String scanPath = imageFile.path;
 
-      // ✅ YOLO sur image entière — pas de crop manuel
-      if (_interpreter != null) {
-        final bbox = _detectPriceTag(fullImage);
-        if (bbox != null) {
-          final margin = 20.0;
-          final x1 = (bbox['x1']! - margin)
-              .clamp(0, fullImage.width.toDouble())
-              .toInt();
-          final y1 = (bbox['y1']! - margin)
-              .clamp(0, fullImage.height.toDouble())
-              .toInt();
-          final x2 = (bbox['x2']! + margin)
-              .clamp(0, fullImage.width.toDouble())
-              .toInt();
-          final y2 = (bbox['y2']! + margin)
-              .clamp(0, fullImage.height.toDouble())
-              .toInt();
-
-          final cropWidth = x2 - x1;
-          final cropHeight = y2 - y1;
-
-          if (cropWidth >= 32 && cropHeight >= 32) {
-            final cropped = img.copyCrop(
-              fullImage,
-              x: x1,
-              y: y1,
-              width: cropWidth,
-              height: cropHeight,
-            );
-            final cropPath = imageFile.path.replaceAll('.jpg', '_crop.jpg');
-            await File(cropPath).writeAsBytes(img.encodeJpg(cropped));
-            scanPath = cropPath;
-            setState(
-              () => detectedText =
-                  'Étiquette trouvée (${(bbox['conf']! * 100).toInt()}%) — lecture...',
-            );
-          } else {
-            setState(
-              () => detectedText = 'Zone détectée trop petite — OCR direct...',
-            );
-          }
-        } else {
-          setState(
-            () => detectedText = 'Étiquette non trouvée — OCR direct...',
-          );
-        }
+      if (boxCrop != null) {
+        final boxCropPath = imageFile.path.replaceAll('.jpg', '_box.jpg');
+        await File(boxCropPath).writeAsBytes(img.encodeJpg(boxCrop));
+        scanPath = boxCropPath;
       }
 
-      // ✅ OCR sur la zone YOLO ou image entière
+      // ✅ OCR sur la zone cropée
       final inputImage = InputImage.fromFilePath(scanPath);
       final RecognizedText recognizedText = await textRecognizer.processImage(
         inputImage,
       );
-      double? price = _extractPrice(recognizedText.text);
+
+      print('📝 OCR: ${recognizedText.text}');
+
+      // ✅ Extraction avec tri spatial
+      double? price = _extractPriceFromBlocks(recognizedText);
 
       if (price != null) {
         HapticFeedback.mediumImpact();
@@ -442,7 +426,6 @@ class _LensScreenState extends State<LensScreen> {
     WakelockPlus.disable();
     controller?.dispose();
     textRecognizer.close();
-    _interpreter?.close();
     super.dispose();
   }
 
@@ -518,9 +501,10 @@ class _LensScreenState extends State<LensScreen> {
             ),
           ),
 
-          // 🔳 Cadre de scan (guide visuel)
+          // ✅ Rectangle bleu avec GlobalKey
           Center(
             child: Container(
+              key: _scanBoxKey,
               width: scanBoxWidth,
               height: scanBoxHeight,
               decoration: BoxDecoration(
