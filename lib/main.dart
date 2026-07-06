@@ -1,41 +1,51 @@
+import 'dart:io';
+import 'dart:ui';
+
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:camera/camera.dart';
-import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:image/image.dart' as img;
+import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'dart:io';
-import 'package:image/image.dart' as img;
+
+import 'models/scanned_product.dart';
+import 'services/camera_service.dart';
+import 'services/crop_service.dart';
+import 'services/image_processor.dart';
+import 'services/ocr_service.dart';
+import 'services/price_detector.dart';
+import 'theme/app_theme.dart';
 
 late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   cameras = await availableCameras();
-  runApp(BudgetscanApp());
+  runApp(const BudgetscanApp());
 }
 
 class BudgetscanApp extends StatelessWidget {
+  const BudgetscanApp({super.key});
+
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'BudgetScan',
-      theme: ThemeData.dark(),
+      theme: ThemeData.dark().copyWith(
+        scaffoldBackgroundColor: AppColors.bgBottom,
+        colorScheme: ThemeData.dark().colorScheme.copyWith(
+          primary: AppColors.emerald,
+          secondary: AppColors.cyan,
+          error: AppColors.danger,
+        ),
+        textTheme: GoogleFonts.interTextTheme(ThemeData.dark().textTheme),
+      ),
       home: LensScreen(),
     );
   }
-}
-
-class ScannedProduct {
-  final String label;
-  final double price;
-  final String imagePath;
-  ScannedProduct({
-    required this.label,
-    required this.price,
-    required this.imagePath,
-  });
 }
 
 class LensScreen extends StatefulWidget {
@@ -44,7 +54,13 @@ class LensScreen extends StatefulWidget {
 }
 
 class _LensScreenState extends State<LensScreen> {
-  CameraController? controller;
+  // --- Services du pipeline (chacun isolé et remplaçable indépendamment) ---
+  final CameraService cameraService = CameraService();
+  final CropService cropService = CropService();
+  final ImageProcessor imageProcessor = ImageProcessor();
+  final OcrService ocrService = OcrService();
+  final PriceDetector priceDetector = PriceDetector();
+
   bool isCameraReady = false;
   bool isProcessing = false;
   bool flashOn = false;
@@ -53,15 +69,19 @@ class _LensScreenState extends State<LensScreen> {
   List<ScannedProduct> products = [];
   String? lastImagePath;
 
-  // ✅ GlobalKey pour position exacte du rectangle bleu
+  // Journal de debug qui s'accumule sur toute la session (le plus récent
+  // en premier), lisible directement sur le téléphone en magasin, sans
+  // avoir besoin d'un copier-coller après chaque scan.
+  final List<String> sessionDebugLog = [];
+
+  // GlobalKey utilisé par le CropService pour retrouver la position exacte
+  // du rectangle bleu à l'écran (RenderBox → rectangle englobant → crop).
   final GlobalKey _scanBoxKey = GlobalKey();
 
-  static const double scanBoxWidth = 300;
-  static const double scanBoxHeight = 180;
-
-  final TextRecognizer textRecognizer = TextRecognizer(
-    script: TextRecognitionScript.latin,
-  );
+  // Rectangle agrandi (ancien : 300x180) pour laisser plus de marge autour
+  // du prix et limiter les coupures de texte lors du crop.
+  static const double scanBoxWidth = 420;
+  static const double scanBoxHeight = 240;
 
   @override
   void initState() {
@@ -73,196 +93,88 @@ class _LensScreenState extends State<LensScreen> {
   Future<void> _initCamera() async {
     final status = await Permission.camera.request();
     if (!status.isGranted) {
-      setState(() => detectedText = "Permission refusée");
+      setState(() => detectedText = 'Permission refusée');
       return;
     }
-    controller = CameraController(
-      cameras[0],
-      ResolutionPreset.medium,
-      enableAudio: false,
-    );
-    await controller!.initialize();
+    await cameraService.initialize(cameras);
     if (!mounted) return;
     setState(() => isCameraReady = true);
   }
 
   Future<void> _toggleFlash() async {
-    if (controller == null) return;
     setState(() => flashOn = !flashOn);
-    await controller!.setFlashMode(flashOn ? FlashMode.torch : FlashMode.off);
+    await cameraService.setFlash(flashOn);
   }
 
-  // ✅ Crop universel via GlobalKey
-  img.Image? _cropScanBox(img.Image fullImage) {
-    try {
-      final RenderBox box =
-          _scanBoxKey.currentContext!.findRenderObject() as RenderBox;
-      final Offset topLeft = box.localToGlobal(Offset.zero);
-      final Size boxSize = box.size;
-      final screenSize = MediaQuery.of(_scanBoxKey.currentContext!).size;
-
-      final scaleX = fullImage.width / screenSize.width;
-      final scaleY = fullImage.height / screenSize.height;
-
-      final x1 = (topLeft.dx * scaleX).toInt().clamp(0, fullImage.width);
-      final y1 = ((topLeft.dy + 80) * scaleY).toInt().clamp(
-        0,
-        fullImage.height,
-      );
-      final x2 = ((topLeft.dx + boxSize.width) * scaleX).toInt().clamp(
-        0,
-        fullImage.width,
-      );
-      final y2 = ((topLeft.dy + boxSize.height + 80) * scaleY).toInt().clamp(
-        0,
-        fullImage.height,
-      );
-
-      print(
-        '✂️ Crop: ($x1,$y1) → ($x2,$y2) sur ${fullImage.width}x${fullImage.height}',
-      );
-
-      return img.copyCrop(
-        fullImage,
-        x: x1,
-        y: y1,
-        width: (x2 - x1).clamp(32, fullImage.width),
-        height: (y2 - y1).clamp(32, fullImage.height),
-      );
-    } catch (e) {
-      print('❌ Erreur crop: $e');
-      return null;
-    }
-  }
-
-  // ✅ Tri spatial des blocs — euros à gauche, centimes à droite
-  double? _extractPriceFromBlocks(RecognizedText recognizedText) {
-    // Trie les blocs par position horizontale (gauche → droite)
-    List<TextBlock> blocks = recognizedText.blocks
-        .where((b) => b.boundingBox != null)
-        .toList();
-
-    blocks.sort((a, b) => a.boundingBox!.left.compareTo(b.boundingBox!.left));
-
-    // Cherche le prix dans chaque bloc du plus grand au plus petit
-    List<MapEntry<TextBlock, double>> blocksWithSize = blocks
-        .map((b) => MapEntry(b, b.boundingBox!.width * b.boundingBox!.height))
-        .toList();
-    blocksWithSize.sort((a, b) => b.value.compareTo(a.value));
-
-    for (final entry in blocksWithSize) {
-      final price = _extractPrice(entry.key.text);
-      if (price != null) {
-        print('💰 Prix: ${entry.key.text} → $price');
-        return price;
-      }
-    }
-
-    // Fallback — texte complet
-    return _extractPrice(recognizedText.text);
-  }
-
-  double? _extractPrice(String text) {
-    String normalized = text
-        .replaceAll('⁰', '0')
-        .replaceAll('¹', '1')
-        .replaceAll('²', '2')
-        .replaceAll('³', '3')
-        .replaceAll('⁴', '4')
-        .replaceAll('⁵', '5')
-        .replaceAll('⁶', '6')
-        .replaceAll('⁷', '7')
-        .replaceAll('⁸', '8')
-        .replaceAll('⁹', '9')
-        .replaceAll('EUR', '')
-        .replaceAll('euro', '')
-        .replaceAll('€/u', '')
-        .replaceAll('€/l', '')
-        .replaceAll('€/kg', '');
-
-    final patterns = [
-      // Format standard : 1.25, 1,25
-      RegExp(r'\b(\d{1,4})[.,](\d{2})\s*€?\b'),
-      // Format 1 décimale : 59.5
-      RegExp(r'\b(\d{1,4})[.,](\d{1})\s*€?\b'),
-      // Format € entre : 1€45
-      RegExp(r'\b(\d{1,4})\s*[€e]\s*(\d{2})\b'),
-      // Format avec saut de ligne : "1\n45"
-      RegExp(r'(\d{1,2})\n(\d{2})\s*€?'),
-      // Format exposant séparé : "0 75"
-      RegExp(r'\b(\d)\s+(\d{2})\s*€?\b'),
-      // Format sans séparateur : 125 → 1.25
-      RegExp(r'\b([1-9])(\d{2})\b'),
-      // Prix entier
-      RegExp(r'\b(\d{1,3})\b'),
-    ];
-
-    List<double> prices = [];
-    for (final regex in patterns) {
-      for (final match in regex.allMatches(normalized)) {
-        String euros = match.group(1)!;
-        String cents = match.groupCount >= 2 && match.group(2) != null
-            ? match.group(2)!
-            : '0';
-        double? price = double.tryParse('$euros.$cents');
-        if (price != null && price > 0 && price < 1000) {
-          prices.add(price);
-        }
-      }
-      if (prices.isNotEmpty) break;
-    }
-
-    if (prices.isEmpty) return null;
-    // Prend le plus petit — en cas de promo c'est le bon
-    return prices.reduce((a, b) => a < b ? a : b);
-  }
-
+  /// Pipeline complet, conforme au schéma du cahier des charges :
+  ///   Camera → Photo HD → Crop → Prétraitement → OCR → Analyse spatiale
+  ///   → Score → Extraction du prix
   Future<void> _scanPrice() async {
-    if (controller == null || isProcessing) return;
+    if (isProcessing) return;
     setState(() {
       isProcessing = true;
       detectedText = 'Scan en cours...';
     });
 
     try {
-      final imageFile = await controller!.takePicture();
-      final imageBytes = await File(imageFile.path).readAsBytes();
-      final fullImage = img.decodeImage(imageBytes)!;
-
-      // ✅ Crop du rectangle bleu via GlobalKey
-      final boxCrop = _cropScanBox(fullImage);
-      String scanPath = imageFile.path;
-
-      if (boxCrop != null) {
-        final boxCropPath = imageFile.path.replaceAll('.jpg', '_box.jpg');
-        await File(boxCropPath).writeAsBytes(img.encodeJpg(boxCrop));
-        scanPath = boxCropPath;
+      // 1. Photo HD.
+      final xfile = await cameraService.takePicture();
+      final bytes = await File(xfile.path).readAsBytes();
+      final fullImage = img.decodeImage(bytes);
+      if (fullImage == null) {
+        throw Exception('Image illisible après capture');
       }
 
-      // ✅ OCR sur la zone cropée
-      final inputImage = InputImage.fromFilePath(scanPath);
-      final RecognizedText recognizedText = await textRecognizer.processImage(
-        inputImage,
+      // 2. Crop précis du rectangle bleu (aucun offset magique).
+      final cropped = cropService.crop(
+        scanBoxKey: _scanBoxKey,
+        fullImage: fullImage,
+        expectedAspectRatio: scanBoxWidth / scanBoxHeight,
+      );
+      if (cropped == null) {
+        throw Exception('Zone de scan introuvable (rectangle non posé)');
+      }
+
+      // 3. Prétraitement : grayscale → autocontraste → sharpen → resize x2.
+      final steps = imageProcessor.process(cropped);
+
+      // 4. Sauvegarde des images de debug (photo, crop, grayscale, sharpen)
+      // pour pouvoir comprendre les erreurs de détection a posteriori.
+      final debugPaths = await _saveDebugImages(
+        original: fullImage,
+        cropped: cropped,
+        grayscale: steps.grayscale,
+        sharpened: steps.sharpened,
+        finalImage: steps.finalImage,
       );
 
-      print('📝 OCR: ${recognizedText.text}');
+      // 5. OCR sur l'image finale prétraitée.
+      final recognizedText = await ocrService.recognize(debugPaths['final']!);
 
-      // ✅ Extraction avec tri spatial
-      double? price = _extractPriceFromBlocks(recognizedText);
+      // 6. Analyse spatiale des blocs + score + extraction du prix.
+      final result = priceDetector.detect(
+        recognizedText,
+        Size(
+          steps.finalImage.width.toDouble(),
+          steps.finalImage.height.toDouble(),
+        ),
+      );
 
-      if (price != null) {
+      _logDetection(result);
+
+      if (result.price != null) {
         HapticFeedback.mediumImpact();
         setState(() {
-          total += price;
-          lastImagePath = imageFile.path;
+          total += result.price!;
+          lastImagePath = xfile.path;
           products.add(
             ScannedProduct(
               label: 'Produit ${products.length + 1}',
-              price: price,
-              imagePath: imageFile.path,
+              price: result.price!,
+              imagePath: xfile.path,
             ),
           );
-          detectedText = '✅ ${price.toStringAsFixed(2)} € ajouté !';
+          detectedText = '✅ ${result.price!.toStringAsFixed(2)} € ajouté !';
         });
       } else {
         HapticFeedback.lightImpact();
@@ -272,6 +184,65 @@ class _LensScreenState extends State<LensScreen> {
       setState(() => detectedText = 'Erreur : $e');
     }
     setState(() => isProcessing = false);
+  }
+
+  /// Écrit sur disque chaque étape du pipeline (utile pour le debug visuel)
+  /// et retourne les chemins de fichiers correspondants.
+  Future<Map<String, String>> _saveDebugImages({
+    required img.Image original,
+    required img.Image cropped,
+    required img.Image grayscale,
+    required img.Image sharpened,
+    required img.Image finalImage,
+  }) async {
+    final dir = await getTemporaryDirectory();
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+
+    Future<String> write(String suffix, img.Image image) async {
+      final path = '${dir.path}/scan_${stamp}_$suffix.jpg';
+      await File(path).writeAsBytes(img.encodeJpg(image));
+      return path;
+    }
+
+    return {
+      'original': await write('original', original),
+      'crop': await write('crop', cropped),
+      'grayscale': await write('grayscale', grayscale),
+      'sharpen': await write('sharpen', sharpened),
+      'final': await write('final', finalImage),
+    };
+  }
+
+  /// Affiche dans la console le détail de la détection, ET ajoute un
+  /// rapport horodaté au journal de session — consultable directement sur
+  /// le téléphone via le bouton "Debug", sans avoir besoin de la console
+  /// VSCode (utile en magasin). Le journal s'accumule scan après scan.
+  void _logDetection(PriceDetectionResult result) {
+    final buffer = StringBuffer();
+    final now = TimeOfDay.now();
+    final timestamp =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+
+    buffer.writeln('=== Scan $timestamp ===');
+    buffer.writeln(
+      '🔎 Éléments retenus : ${result.elementsInZone} '
+      '(${result.elementsRejectedOutsideZone} rejetés hors zone)',
+    );
+
+    if (result.candidates.isEmpty) {
+      buffer.writeln('Aucun candidat de prix trouvé.');
+    }
+
+    for (var i = 0; i < result.candidates.length; i++) {
+      buffer.writeln('Candidat ${i + 1} | ${result.candidates[i]}');
+    }
+
+    final report = buffer.toString();
+    // ignore: avoid_print
+    print(report);
+
+    // Le plus récent en tête de liste : pas besoin de scroller en magasin.
+    setState(() => sessionDebugLog.insert(0, report));
   }
 
   void _removeProduct(int index) {
@@ -295,109 +266,257 @@ class _LensScreenState extends State<LensScreen> {
   void _showHistory() {
     showModalBottomSheet(
       context: context,
-      backgroundColor: Colors.grey[900],
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (context) => Column(
-        children: [
-          Padding(
-            padding: EdgeInsets.all(16),
-            child: Text(
-              'Historique de la session',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
+      backgroundColor: Colors.transparent,
+      builder: (context) => ClipRRect(
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+          child: Container(
+            height: MediaQuery.of(context).size.height * 0.6,
+            decoration: BoxDecoration(
+              color: const Color(0xF20A0F1E),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(28),
+              ),
+              border: const Border(
+                top: BorderSide(color: AppColors.glassBorder),
               ),
             ),
-          ),
-          Expanded(
-            child: products.isEmpty
-                ? Center(
-                    child: Text(
-                      'Aucun scan cette session',
-                      style: TextStyle(color: Colors.grey),
-                    ),
-                  )
-                : ListView.builder(
-                    itemCount: products.length,
-                    itemBuilder: (context, index) {
-                      final p = products[index];
-                      return ListTile(
-                        leading: File(p.imagePath).existsSync()
-                            ? ClipRRect(
-                                borderRadius: BorderRadius.circular(8),
-                                child: Image.file(
-                                  File(p.imagePath),
-                                  width: 50,
-                                  height: 50,
-                                  fit: BoxFit.cover,
-                                ),
-                              )
-                            : Icon(Icons.image, color: Colors.grey),
-                        title: Text(
-                          p.label,
-                          style: TextStyle(color: Colors.white),
-                        ),
-                        trailing: Text(
-                          '${p.price.toStringAsFixed(2)} €',
-                          style: TextStyle(
-                            color: Colors.blue,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      );
-                    },
+            child: Column(
+              children: [
+                Container(
+                  margin: const EdgeInsets.only(top: 10),
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    gradient: AppColors.primaryGradient,
+                    borderRadius: BorderRadius.circular(4),
                   ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: GradientText(
+                    'Historique de la session',
+                    style: AppText.display(size: 17),
+                  ),
+                ),
+                Expanded(
+                  child: products.isEmpty
+                      ? Center(
+                          child: Text(
+                            'Aucun scan cette session',
+                            style: AppText.body(color: AppColors.textMuted),
+                          ),
+                        )
+                      : ListView.builder(
+                          padding: const EdgeInsets.symmetric(horizontal: 12),
+                          itemCount: products.length,
+                          itemBuilder: (context, index) {
+                            final p = products[index];
+                            return Container(
+                              margin: const EdgeInsets.symmetric(vertical: 4),
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                              ),
+                              decoration: glassDecoration(radius: 14),
+                              child: ListTile(
+                                leading: File(p.imagePath).existsSync()
+                                    ? ClipRRect(
+                                        borderRadius: BorderRadius.circular(10),
+                                        child: Image.file(
+                                          File(p.imagePath),
+                                          width: 44,
+                                          height: 44,
+                                          fit: BoxFit.cover,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.image_outlined,
+                                        color: AppColors.textMuted,
+                                      ),
+                                title: Text(
+                                  p.label,
+                                  style: AppText.body(
+                                    color: AppColors.textPrimary,
+                                  ),
+                                ),
+                                trailing: GradientText(
+                                  '${p.price.toStringAsFixed(2)} €',
+                                  style: AppText.mono(
+                                    size: 15,
+                                    weight: FontWeight.w700,
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
           ),
-        ],
+        ),
       ),
     );
   }
 
   void _showMenu(BuildContext context) {
+    Widget menuTile(
+      IconData icon,
+      Color iconColor,
+      String label,
+      VoidCallback onTap,
+    ) {
+      return ListTile(
+        leading: Icon(icon, color: iconColor, size: 20),
+        title: Text(label, style: AppText.body(color: AppColors.textPrimary)),
+        onTap: onTap,
+      );
+    }
+
     showModalBottomSheet(
       context: context,
-      backgroundColor: Colors.grey[900],
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-      ),
-      builder: (context) => Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ListTile(
-            leading: Icon(Icons.info_outline, color: Colors.blue),
-            title: Text('À propos', style: TextStyle(color: Colors.white)),
-            onTap: () {
-              Navigator.pop(context);
-              _showPage(
-                'À propos',
-                'BudgetScan est une application de scan de prix privacy-first. Aucune donnée collectée, aucun compte requis.',
-              );
-            },
-          ),
-          ListTile(
-            leading: Icon(Icons.gavel, color: Colors.blue),
-            title: Text(
-              "Conditions d'utilisation",
-              style: TextStyle(color: Colors.white),
+      backgroundColor: Colors.transparent,
+      builder: (context) => ClipRRect(
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+          child: Container(
+            decoration: BoxDecoration(
+              color: const Color(0xF20A0F1E),
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(28),
+              ),
+              border: const Border(
+                top: BorderSide(color: AppColors.glassBorder),
+              ),
             ),
-            onTap: () {
-              Navigator.pop(context);
-              _showPage(
-                "Conditions d'utilisation",
-                'Lorem ipsum dolor sit amet, consectetur adipiscing elit.',
-              );
-            },
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  margin: const EdgeInsets.symmetric(vertical: 10),
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    gradient: AppColors.primaryGradient,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                ),
+                menuTile(
+                  Icons.bug_report_outlined,
+                  AppColors.gold,
+                  'Debug session',
+                  () {
+                    Navigator.pop(context);
+                    _showDebugReport();
+                  },
+                ),
+                menuTile(
+                  Icons.info_outline_rounded,
+                  AppColors.cyan,
+                  'À propos',
+                  () {
+                    Navigator.pop(context);
+                    _showPage(
+                      'À propos',
+                      'BudgetScan est une application de scan de prix privacy-first. Aucune donnée collectée, aucun compte requis.',
+                    );
+                  },
+                ),
+                menuTile(
+                  Icons.gavel_rounded,
+                  AppColors.cyan,
+                  "Conditions d'utilisation",
+                  () {
+                    Navigator.pop(context);
+                    _showPage(
+                      "Conditions d'utilisation",
+                      'Lorem ipsum dolor sit amet, consectetur adipiscing elit.',
+                    );
+                  },
+                ),
+                menuTile(
+                  Icons.mail_outline_rounded,
+                  AppColors.cyan,
+                  'Contact',
+                  () {
+                    Navigator.pop(context);
+                    _showPage(
+                      'Contact',
+                      'Pour nous contacter : contact@weboara.fr',
+                    );
+                  },
+                ),
+                const SizedBox(height: 8),
+              ],
+            ),
           ),
-          ListTile(
-            leading: Icon(Icons.mail_outline, color: Colors.blue),
-            title: Text('Contact', style: TextStyle(color: Colors.white)),
-            onTap: () {
-              Navigator.pop(context);
-              _showPage('Contact', 'Pour nous contacter : contact@weboara.fr');
-            },
+        ),
+      ),
+    );
+  }
+
+  void _showDebugReport() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xF20A0F1E),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: const BorderSide(color: AppColors.glassBorder),
+        ),
+        title: Text(
+          'Debug session (${sessionDebugLog.length} scan${sessionDebugLog.length > 1 ? 's' : ''})',
+          style: AppText.display(size: 15),
+        ),
+        content: SizedBox(
+          width: double.maxFinite,
+          child: SingleChildScrollView(
+            child: SelectableText(
+              sessionDebugLog.isEmpty
+                  ? 'Aucun scan effectué pour le moment.'
+                  : sessionDebugLog.join('\n'),
+              style: TextStyle(
+                color: AppColors.emerald,
+                fontSize: 12,
+                fontFamily: GoogleFonts.spaceGrotesk().fontFamily,
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: sessionDebugLog.isEmpty
+                ? null
+                : () {
+                    setState(() => sessionDebugLog.clear());
+                    Navigator.pop(context);
+                  },
+            child: Text(
+              'Effacer',
+              style: AppText.body(color: AppColors.danger),
+            ),
+          ),
+          TextButton(
+            onPressed: sessionDebugLog.isEmpty
+                ? null
+                : () {
+                    Clipboard.setData(
+                      ClipboardData(text: sessionDebugLog.join('\n')),
+                    );
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Journal complet copié')),
+                    );
+                  },
+            child: Text(
+              'Copier tout',
+              style: AppText.body(color: AppColors.gold),
+            ),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text('Fermer', style: AppText.body(color: AppColors.cyan)),
           ),
         ],
       ),
@@ -408,13 +527,20 @@ class _LensScreenState extends State<LensScreen> {
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
-        backgroundColor: Colors.grey[900],
-        title: Text(title, style: TextStyle(color: Colors.white)),
-        content: Text(content, style: TextStyle(color: Colors.grey[300])),
+        backgroundColor: const Color(0xF20A0F1E),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: const BorderSide(color: AppColors.glassBorder),
+        ),
+        title: Text(title, style: AppText.display(size: 16)),
+        content: Text(
+          content,
+          style: AppText.body(color: AppColors.textSecondary),
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context),
-            child: Text('Fermer', style: TextStyle(color: Colors.blue)),
+            child: Text('Fermer', style: AppText.body(color: AppColors.cyan)),
           ),
         ],
       ),
@@ -424,266 +550,341 @@ class _LensScreenState extends State<LensScreen> {
   @override
   void dispose() {
     WakelockPlus.disable();
-    controller?.dispose();
-    textRecognizer.close();
+    cameraService.dispose();
+    ocrService.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    if (!isCameraReady) {
+    if (!isCameraReady || cameraService.controller == null) {
       return Scaffold(
-        backgroundColor: Colors.black,
-        body: Center(child: CircularProgressIndicator()),
+        backgroundColor: AppColors.bgBottom,
+        body: Container(
+          decoration: const BoxDecoration(gradient: AppColors.bgGradient),
+          child: Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const CircularProgressIndicator(color: AppColors.emerald),
+                const SizedBox(height: 16),
+                Text(
+                  'Initialisation de la caméra…',
+                  style: AppText.body(color: AppColors.textSecondary),
+                ),
+              ],
+            ),
+          ),
+        ),
       );
     }
 
     return Scaffold(
       body: Stack(
         children: [
-          CameraPreview(controller!),
-          Container(color: Colors.black.withOpacity(0.3)),
+          CameraPreview(cameraService.controller!),
+          // Voile graphite dégradé (haut plus sombre, bas plus sombre encore)
+          // pour un rendu "fintech premium" plutôt qu'un simple assombrissement.
+          Container(
+            decoration: const BoxDecoration(
+              gradient: LinearGradient(
+                begin: Alignment.topCenter,
+                end: Alignment.bottomCenter,
+                colors: [
+                  Color(0x99050810),
+                  Color(0x33050810),
+                  Color(0xB3050810),
+                ],
+                stops: [0.0, 0.45, 1.0],
+              ),
+            ),
+          ),
 
-          // 🔝 Header
+          // Header — bandeau verre dépoli, logo en dégradé émeraude/cyan.
           Positioned(
             top: 0,
             left: 0,
             right: 0,
             child: SafeArea(
               child: Padding(
-                padding: EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                  children: [
-                    GestureDetector(
-                      onTap: _toggleFlash,
-                      child: Container(
-                        width: 40,
-                        height: 40,
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.5),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Icon(
-                          flashOn ? Icons.flash_on : Icons.flash_off,
-                          color: flashOn ? Colors.yellow : Colors.white,
-                          size: 20,
-                        ),
+                padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(20),
+                  child: BackdropFilter(
+                    filter: ImageFilter.blur(sigmaX: 16, sigmaY: 16),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 10,
+                        vertical: 8,
+                      ),
+                      decoration: glassDecoration(radius: 20),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          _GlassIconButton(
+                            icon: flashOn ? Icons.flash_on : Icons.flash_off,
+                            iconColor: flashOn
+                                ? AppColors.gold
+                                : AppColors.textPrimary,
+                            onTap: _toggleFlash,
+                          ),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              GradientText(
+                                'BudgetScan',
+                                style: AppText.display(size: 19),
+                              ),
+                            ],
+                          ),
+                          _GlassIconButton(
+                            icon: Icons.more_vert,
+                            onTap: () => _showMenu(context),
+                          ),
+                        ],
                       ),
                     ),
-                    Text(
-                      'BudgetScan',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontSize: 18,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    GestureDetector(
-                      onTap: () => _showMenu(context),
-                      child: Container(
-                        width: 40,
-                        height: 40,
-                        decoration: BoxDecoration(
-                          color: Colors.black.withOpacity(0.5),
-                          shape: BoxShape.circle,
-                        ),
-                        child: Icon(
-                          Icons.more_vert,
-                          color: Colors.white,
-                          size: 20,
-                        ),
-                      ),
-                    ),
-                  ],
+                  ),
                 ),
               ),
             ),
           ),
 
-          // ✅ Rectangle bleu avec GlobalKey
+          // Zone de scan — coins néon façon scanner high-tech
+          // (seule la zone à l'intérieur est analysée).
           Center(
-            child: Container(
+            child: SizedBox(
               key: _scanBoxKey,
               width: scanBoxWidth,
               height: scanBoxHeight,
-              decoration: BoxDecoration(
-                border: Border.all(color: Colors.blue, width: 2),
-                borderRadius: BorderRadius.circular(12),
-              ),
+              child: CustomPaint(painter: _ScanCornersPainter()),
             ),
           ),
 
-          // 📋 Panel bas
+          // Panneau bas — verre dépoli premium avec liseré dégradé en tête.
           Positioned(
             bottom: 0,
             left: 0,
             right: 0,
-            child: Container(
-              constraints: BoxConstraints(maxHeight: 350),
-              decoration: BoxDecoration(
-                color: Colors.black.withOpacity(0.85),
-                borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+            child: ClipRRect(
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(28),
               ),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Padding(
-                    padding: EdgeInsets.fromLTRB(12, 12, 12, 4),
-                    child: Text(
-                      detectedText,
-                      style: TextStyle(color: Colors.white, fontSize: 12),
-                      textAlign: TextAlign.center,
-                      maxLines: 3,
-                      overflow: TextOverflow.ellipsis,
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+                child: Container(
+                  constraints: const BoxConstraints(maxHeight: 360),
+                  decoration: BoxDecoration(
+                    color: const Color(0xE60A0F1E),
+                    borderRadius: const BorderRadius.vertical(
+                      top: Radius.circular(28),
+                    ),
+                    border: const Border(
+                      top: BorderSide(color: AppColors.glassBorder, width: 1),
                     ),
                   ),
-                  if (products.isNotEmpty)
-                    SizedBox(
-                      height: 100,
-                      child: ListView.builder(
-                        itemCount: products.length,
-                        itemBuilder: (context, index) {
-                          final p = products[index];
-                          return ListTile(
-                            dense: true,
-                            title: Text(
-                              p.label,
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 12,
-                              ),
-                            ),
-                            trailing: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Text(
-                                  '${p.price.toStringAsFixed(2)} €',
-                                  style: TextStyle(
-                                    color: Colors.blue,
-                                    fontWeight: FontWeight.bold,
-                                    fontSize: 13,
-                                  ),
-                                ),
-                                IconButton(
-                                  icon: Icon(
-                                    Icons.delete,
-                                    color: Colors.red,
-                                    size: 16,
-                                  ),
-                                  onPressed: () => _removeProduct(index),
-                                ),
-                              ],
-                            ),
-                          );
-                        },
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Liseré dégradé décoratif (poignée du panneau).
+                      Container(
+                        margin: const EdgeInsets.only(top: 10),
+                        width: 40,
+                        height: 4,
+                        decoration: BoxDecoration(
+                          gradient: AppColors.primaryGradient,
+                          borderRadius: BorderRadius.circular(4),
+                        ),
                       ),
-                    ),
-                  Container(
-                    margin: EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-                    padding: EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                    decoration: BoxDecoration(
-                      color: Colors.blue.withOpacity(0.2),
-                      borderRadius: BorderRadius.circular(30),
-                      border: Border.all(color: Colors.blue),
-                    ),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        Text(
-                          'Total',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
+                      Padding(
+                        padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                        child: Text(
+                          detectedText,
+                          style: AppText.body(
+                            size: 12.5,
+                            color: AppColors.textSecondary,
                           ),
+                          textAlign: TextAlign.center,
+                          maxLines: 3,
+                          overflow: TextOverflow.ellipsis,
                         ),
-                        Text(
-                          '${total.toStringAsFixed(2)} €',
-                          style: TextStyle(
-                            color: Colors.blue,
-                            fontSize: 18,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  Padding(
-                    padding: EdgeInsets.only(bottom: 16, top: 4),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        GestureDetector(
-                          onTap: _showHistory,
-                          child: Container(
-                            width: 48,
-                            height: 48,
-                            margin: EdgeInsets.only(right: 24),
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              border: Border.all(color: Colors.white, width: 2),
-                              color: Colors.grey[800],
-                            ),
-                            child:
-                                lastImagePath != null &&
-                                    File(lastImagePath!).existsSync()
-                                ? ClipOval(
-                                    child: Image.file(
-                                      File(lastImagePath!),
-                                      fit: BoxFit.cover,
+                      ),
+                      if (products.isNotEmpty)
+                        SizedBox(
+                          height: 104,
+                          child: ListView.builder(
+                            itemCount: products.length,
+                            itemBuilder: (context, index) {
+                              final p = products[index];
+                              return Container(
+                                margin: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 3,
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 2,
+                                ),
+                                decoration: glassDecoration(radius: 12),
+                                child: ListTile(
+                                  dense: true,
+                                  contentPadding: EdgeInsets.zero,
+                                  title: Text(
+                                    p.label,
+                                    style: AppText.body(
+                                      size: 13,
+                                      color: AppColors.textPrimary,
                                     ),
-                                  )
-                                : Icon(
-                                    Icons.history,
-                                    color: Colors.white,
-                                    size: 22,
                                   ),
+                                  trailing: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      GradientText(
+                                        '${p.price.toStringAsFixed(2)} €',
+                                        style: AppText.mono(
+                                          size: 14,
+                                          weight: FontWeight.w700,
+                                        ),
+                                      ),
+                                      IconButton(
+                                        icon: const Icon(
+                                          Icons.close_rounded,
+                                          color: AppColors.danger,
+                                          size: 16,
+                                        ),
+                                        onPressed: () => _removeProduct(index),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+                            },
                           ),
                         ),
-                        GestureDetector(
-                          onTap: _scanPrice,
-                          child: Container(
-                            width: 72,
-                            height: 72,
-                            decoration: BoxDecoration(
-                              shape: BoxShape.circle,
-                              color: isProcessing ? Colors.grey : Colors.blue,
-                              border: Border.all(color: Colors.white, width: 3),
+                      Container(
+                        margin: const EdgeInsets.fromLTRB(16, 8, 16, 6),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 20,
+                          vertical: 14,
+                        ),
+                        decoration: BoxDecoration(
+                          gradient: LinearGradient(
+                            begin: Alignment.topLeft,
+                            end: Alignment.bottomRight,
+                            colors: [
+                              AppColors.emerald.withOpacity(0.16),
+                              AppColors.cyan.withOpacity(0.10),
+                            ],
+                          ),
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: AppColors.emerald.withOpacity(0.4),
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            Text('TOTAL', style: AppText.label(size: 12)),
+                            GradientText(
+                              '${total.toStringAsFixed(2)} €',
+                              style: AppText.display(size: 24),
                             ),
-                            child: isProcessing
-                                ? Padding(
-                                    padding: EdgeInsets.all(14),
-                                    child: CircularProgressIndicator(
-                                      color: Colors.white,
-                                      strokeWidth: 2,
-                                    ),
-                                  )
-                                : Icon(
-                                    Icons.camera_alt,
-                                    color: Colors.white,
-                                    size: 32,
-                                  ),
-                          ),
+                          ],
                         ),
-                        if (products.isNotEmpty)
-                          GestureDetector(
-                            onTap: _resetAll,
-                            child: Container(
-                              width: 48,
-                              height: 48,
-                              margin: EdgeInsets.only(left: 24),
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                border: Border.all(color: Colors.red, width: 2),
+                      ),
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 20, top: 6),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            GestureDetector(
+                              onTap: _showHistory,
+                              child: Container(
+                                width: 48,
+                                height: 48,
+                                margin: const EdgeInsets.only(right: 26),
+                                decoration: glassDecoration(radius: 24),
+                                child:
+                                    lastImagePath != null &&
+                                        File(lastImagePath!).existsSync()
+                                    ? ClipOval(
+                                        child: Image.file(
+                                          File(lastImagePath!),
+                                          fit: BoxFit.cover,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.history_rounded,
+                                        color: AppColors.textPrimary,
+                                        size: 21,
+                                      ),
                               ),
-                              child: Icon(Icons.refresh, color: Colors.red),
                             ),
-                          ),
-                      ],
-                    ),
+                            GestureDetector(
+                              onTap: _scanPrice,
+                              child: Container(
+                                width: 76,
+                                height: 76,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  gradient: isProcessing
+                                      ? null
+                                      : AppColors.primaryGradient,
+                                  color: isProcessing
+                                      ? AppColors.textMuted
+                                      : null,
+                                  boxShadow: isProcessing
+                                      ? []
+                                      : [
+                                          BoxShadow(
+                                            color: AppColors.emerald
+                                                .withOpacity(0.45),
+                                            blurRadius: 22,
+                                            spreadRadius: 1,
+                                          ),
+                                        ],
+                                ),
+                                child: isProcessing
+                                    ? const Padding(
+                                        padding: EdgeInsets.all(16),
+                                        child: CircularProgressIndicator(
+                                          color: Colors.white,
+                                          strokeWidth: 2.4,
+                                        ),
+                                      )
+                                    : const Icon(
+                                        Icons.camera_alt_rounded,
+                                        color: Color(0xFF04101B),
+                                        size: 32,
+                                      ),
+                              ),
+                            ),
+                            if (products.isNotEmpty)
+                              GestureDetector(
+                                onTap: _resetAll,
+                                child: Container(
+                                  width: 48,
+                                  height: 48,
+                                  margin: const EdgeInsets.only(left: 26),
+                                  decoration: glassDecoration(
+                                    radius: 24,
+                                    borderColor: AppColors.danger.withOpacity(
+                                      0.5,
+                                    ),
+                                  ),
+                                  child: const Icon(
+                                    Icons.refresh_rounded,
+                                    color: AppColors.danger,
+                                    size: 20,
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                ],
+                ),
               ),
             ),
           ),
@@ -691,4 +892,111 @@ class _LensScreenState extends State<LensScreen> {
       ),
     );
   }
+}
+
+/// Bouton circulaire en verre dépoli utilisé dans le header.
+class _GlassIconButton extends StatelessWidget {
+  final IconData icon;
+  final Color iconColor;
+  final VoidCallback onTap;
+
+  const _GlassIconButton({
+    required this.icon,
+    required this.onTap,
+    this.iconColor = AppColors.textPrimary,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 38,
+        height: 38,
+        decoration: glassDecoration(radius: 19),
+        child: Icon(icon, color: iconColor, size: 19),
+      ),
+    );
+  }
+}
+
+/// Dessine les 4 coins néon (dégradé émeraude → cyan) de la zone de scan,
+/// pour un rendu "scanner" haut de gamme plutôt qu'un simple cadre plein.
+class _ScanCornersPainter extends CustomPainter {
+  static const double _cornerLength = 28;
+  static const double _strokeWidth = 3.5;
+  static const double _radius = 16;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final rect = Offset.zero & size;
+
+    // Contour discret sur toute la zone (transparence).
+    final basePaint = Paint()
+      ..color = AppColors.glassStroke
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.2;
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, const Radius.circular(_radius)),
+      basePaint,
+    );
+
+    final gradientPaint = Paint()
+      ..shader = AppColors.primaryGradient.createShader(rect)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = _strokeWidth
+      ..strokeCap = StrokeCap.round;
+
+    void corner(Offset start, Offset mid, Offset end) {
+      final path = Path()
+        ..moveTo(start.dx, start.dy)
+        ..lineTo(mid.dx, mid.dy)
+        ..lineTo(end.dx, end.dy);
+      canvas.drawPath(path, gradientPaint);
+    }
+
+    // Haut-gauche.
+    corner(
+      Offset(0, _cornerLength + _radius),
+      Offset(0, _radius),
+      Offset(_radius, 0),
+    );
+    corner(Offset(_radius, 0), Offset(_radius, 0), Offset(_cornerLength, 0));
+    // Haut-droite.
+    corner(
+      Offset(size.width - _cornerLength, 0),
+      Offset(size.width - _radius, 0),
+      Offset(size.width, _radius),
+    );
+    canvas.drawLine(
+      Offset(size.width, _radius),
+      Offset(size.width, _cornerLength + _radius),
+      gradientPaint,
+    );
+    // Bas-gauche.
+    canvas.drawLine(
+      Offset(0, size.height - _cornerLength - _radius),
+      Offset(0, size.height - _radius),
+      gradientPaint,
+    );
+    corner(
+      Offset(0, size.height - _radius),
+      Offset(0, size.height),
+      Offset(_cornerLength, size.height),
+    );
+    // Bas-droite.
+    canvas.drawLine(
+      Offset(size.width, size.height - _cornerLength - _radius),
+      Offset(size.width, size.height - _radius),
+      gradientPaint,
+    );
+    corner(
+      Offset(size.width - _cornerLength, size.height),
+      Offset(size.width, size.height),
+      Offset(size.width, size.height - _radius),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
 }
