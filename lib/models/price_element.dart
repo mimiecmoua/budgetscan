@@ -37,10 +37,54 @@ class PriceElement {
   bool get isCurrencySymbol =>
       text.trim() == '€' || text.trim().toLowerCase() == 'e';
 
-  /// Token qui contient déjà un prix complet, ex : "1,49" ou "12.95".
-  /// C'est le cas le plus simple : ML Kit a réuni euros et centimes dans
-  /// un seul élément.
-  bool get isDirectPriceToken => RegExp(r'^\d{1,3}[.,]\d{1,2}$').hasMatch(text);
+  static final RegExp _decimalToken = RegExp(r'^€?\d{1,3}[.,]\d{1,2}€?$');
+  static final RegExp _euroSeparatorToken = RegExp(r'^\d{1,3}[€e]\d{2}$');
+  static final RegExp _noCentsToken = RegExp(r'^€?\d{1,3},-€?$');
+
+  /// Token qui contient déjà un prix complet. Couvre :
+  ///   - séparateur classique, avec ou sans € collé : "1,49", "12,40€", "€12.99"
+  ///   - € utilisé comme séparateur décimal : "2€49", "5€99"
+  ///   - prix rond, tiret pour les centimes : "4,-€" (= 4,00€)
+  /// C'est le cas le plus simple : ML Kit a réuni euros et centimes (et
+  /// parfois le symbole €) dans un seul élément.
+  bool get isDirectPriceToken =>
+      _decimalToken.hasMatch(text) ||
+      _euroSeparatorToken.hasMatch(text) ||
+      _noCentsToken.hasMatch(text);
+
+  /// Version tolérante de [isPureDigits] : accepte aussi un nombre isolé
+  /// mal lu à cause d'une confusion OCR classique (la lettre "O" pour le
+  /// chiffre "0", "l"/"I" pour "1"), ou d'un fragment de symbole parasite
+  /// resté collé ("o`" au lieu de "0") — utile quand ML Kit sépare bien
+  /// les deux nombres d'un prix, mais mélit l'un d'eux comme une lettre ou
+  /// laisse un débris de ponctuation. Retourne la version corrigée si
+  /// exploitable, sinon `null`.
+  String? get normalizedDigits {
+    final cleaned = text
+        .replaceAll(RegExp(r"[°'`ʻ´]"), '')
+        .replaceAll(RegExp(r'[oO]'), '0')
+        .replaceAll(RegExp(r'[lI]'), '1');
+    return RegExp(r'^\d{1,3}$').hasMatch(cleaned) ? cleaned : null;
+  }
+
+  /// Tente de corriger les confusions OCR classiques rencontrées quand un
+  /// petit exposant (€, virgule) fusionne avec les chiffres au lieu
+  /// d'être ignoré : la lettre "o"/"O" est presque toujours un "0" mal lu,
+  /// "l"/"I" un "1" mal lu, et les apostrophes/guillemets courbes/degrés
+  /// parasites remplacent souvent le symbole fondu. Ex : "o`79" → "079",
+  /// "1lo9" → "1109".
+  ///
+  /// Ne retourne un résultat que si, une fois nettoyé, le token est un
+  /// nombre pur de 3 ou 4 chiffres (sinon on risque de corrompre un vrai
+  /// mot) — jamais utilisé pour des tokens qui ne ressemblent déjà pas à
+  /// un prix fusionné.
+  String? get cleanedDigitsOnly {
+    final cleaned = text
+        .replaceAll(RegExp(r"[°'`ʻ´]"), '')
+        .replaceAll(RegExp(r'[oO]'), '0')
+        .replaceAll(RegExp(r'[lI]'), '1');
+    return RegExp(r'^\d{3,4}$').hasMatch(cleaned) ? cleaned : null;
+  }
 
   @override
   String toString() =>

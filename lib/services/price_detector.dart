@@ -5,6 +5,7 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 
 import '../models/composed_price.dart';
 import '../models/price_element.dart';
+import 'known_price_formats.dart';
 import 'price_validator.dart';
 import 'regex_normalizer.dart';
 
@@ -16,12 +17,14 @@ class PriceDetectionResult {
   final List<ComposedPrice> candidates;
   final int elementsInZone;
   final int elementsRejectedOutsideZone;
+  final List<PriceElement> retainedElements;
 
   PriceDetectionResult({
     required this.price,
     required this.candidates,
     required this.elementsInZone,
     required this.elementsRejectedOutsideZone,
+    this.retainedElements = const [],
   });
 }
 
@@ -75,6 +78,7 @@ class PriceDetector {
         candidates: [],
         elementsInZone: 0,
         elementsRejectedOutsideZone: rejectedCount,
+        retainedElements: [],
       );
     }
 
@@ -82,13 +86,43 @@ class PriceDetector {
 
     // Cas simple : un seul élément contient déjà un prix complet ("1,49").
     for (final element in elementsInZone) {
-      if (!element.isDirectPriceToken) continue;
-      final value = normalizer.extract(element.text);
+      if (element.isDirectPriceToken) {
+        final value = normalizer.extract(element.text);
+        if (value == null) continue;
+
+        // Confronte la forme brute au catalogue des conventions connues
+        // (cf. KnownPriceFormats) : un prix qui correspond à une forme
+        // réellement observée sur le marché est plus fiable qu'une simple
+        // coïncidence de regex.
+        final knownFormat = KnownPriceFormats.identify(element.text);
+
+        candidates.add(ComposedPrice(
+          value: value,
+          sourceElements: [element],
+          reason: knownFormat != null
+              ? 'token direct — format connu : $knownFormat'
+              : 'token direct — format non catalogué',
+        ));
+        continue;
+      }
+
+      // Cas "confusion OCR" : le petit exposant (€, virgule) a fusionné
+      // avec les chiffres et les a fait mal lire ("o`79" au lieu de
+      // "0,79"). On tente une correction des confusions classiques avant
+      // d'abandonner ce token.
+      final cleaned = element.cleanedDigitsOnly;
+      if (cleaned == null) continue;
+
+      final centsStr = cleaned.substring(cleaned.length - 2);
+      final eurosStr = cleaned.substring(0, cleaned.length - 2);
+      final value = double.tryParse('$eurosStr.$centsStr');
       if (value == null) continue;
+
       candidates.add(ComposedPrice(
         value: value,
         sourceElements: [element],
-        reason: 'token direct',
+        reason: 'token direct — caractères ambigus corrigés '
+            '("${element.text}" → "$cleaned")',
       ));
     }
 
@@ -102,6 +136,7 @@ class PriceDetector {
         candidates: [],
         elementsInZone: elementsInZone.length,
         elementsRejectedOutsideZone: rejectedCount,
+        retainedElements: elementsInZone,
       );
     }
 
@@ -116,6 +151,7 @@ class PriceDetector {
           candidates: candidates,
           elementsInZone: elementsInZone.length,
           elementsRejectedOutsideZone: rejectedCount,
+          retainedElements: elementsInZone,
         );
       }
     }
@@ -125,6 +161,7 @@ class PriceDetector {
       candidates: candidates,
       elementsInZone: elementsInZone.length,
       elementsRejectedOutsideZone: rejectedCount,
+      retainedElements: elementsInZone,
     );
   }
 
@@ -164,40 +201,54 @@ class PriceDetector {
   /// et/ou plus haut (centimes en exposant) — confirmé si possible par un
   /// symbole € à proximité.
   List<ComposedPrice> _composeFromDigitPairs(List<PriceElement> elements) {
-    final digitElements = elements.where((e) => e.isPureDigits).toList();
+    // On indexe chaque élément par sa version "chiffres corrigés" plutôt
+    // que son texte brut : un "0" lu comme la lettre "O" doit quand même
+    // pouvoir jouer le rôle du nombre "euros" dans la reconstruction.
+    final digitElements = <PriceElement, String>{};
+    for (final element in elements) {
+      final normalized = element.normalizedDigits;
+      if (normalized != null) digitElements[element] = normalized;
+    }
     final currencyElements =
         elements.where((e) => e.isCurrencySymbol).toList();
 
     final composed = <ComposedPrice>[];
 
-    for (final euros in digitElements) {
+    for (final euros in digitElements.keys) {
+      final eurosDigits = digitElements[euros]!;
       // Un nombre "euros" plausible fait au plus 3 chiffres (évite les
       // codes-barres, poids, quantités en grammes...).
-      if (euros.text.length > 3) continue;
+      if (eurosDigits.length > 3) continue;
 
-      for (final cents in digitElements) {
+      for (final cents in digitElements.keys) {
         if (identical(euros, cents)) continue;
-        if (cents.text.length > 2) continue;
+        final centsDigits = digitElements[cents]!;
+        if (centsDigits.length > 2) continue;
 
         // Règles géométriques (cahier des charges v2, point 16) :
-        //   - petit nombre, à droite, plus haut  → centimes
+        //   - petit nombre, à droite, plus haut  → centimes en exposant
         //   - grand nombre                        → euros
+        //   - OU : même taille, même ligne, juste séparés par un espace
+        //     (ex : "8 99 €") — cas fréquent qu'une simple comparaison de
+        //     taille de police ne peut pas capturer, car les deux nombres
+        //     sont visuellement identiques.
         final isToTheRight = cents.left >= euros.right - (euros.width * 0.2);
         final isSmallerFont =
             cents.estimatedFontSize < euros.estimatedFontSize * 0.85;
         final isHigher = cents.top < euros.top - (euros.height * 0.1);
+        final isSameLineSameSize = _isSameLineSameSize(euros, cents);
         final maxNeighbourDistance = euros.height * 3;
         final distance = (cents.center - euros.center).distance;
 
         if (!isToTheRight) continue;
-        if (!(isSmallerFont || isHigher)) continue;
+        if (!(isSmallerFont || isHigher || isSameLineSameSize)) continue;
         if (distance > maxNeighbourDistance) continue;
 
         // Un seul chiffre de centimes est traité comme un dixième
         // (ex : "59" + "5" → 59.50), cas plus rare mais déjà vu sur des
         // étiquettes promotionnelles.
-        final centsText = cents.text.length == 1 ? '${cents.text}0' : cents.text;
-        final value = double.tryParse('${euros.text}.$centsText');
+        final centsText = centsDigits.length == 1 ? '${centsDigits}0' : centsDigits;
+        final value = double.tryParse('$eurosDigits.$centsText');
         if (value == null) continue;
 
         // € à proximité : renforce la confiance sans être obligatoire
@@ -230,6 +281,8 @@ class PriceDetector {
 
   /// Score de confiance :
   ///   - Token direct déjà combiné ("1,49")        → base 50 (très fiable)
+  ///       + 15 supplémentaires si sa forme correspond à une convention
+  ///         cataloguée dans KnownPriceFormats (ex : style Lidl, Action...)
   ///   - Sinon (reconstruction géométrique) :
   ///       +40 si un symbole € a été trouvé à proximité
   ///       +20 si le nombre "euros" a une police nettement plus grande
@@ -248,8 +301,13 @@ class PriceDetector {
       int score = 0;
       final elements = candidate.sourceElements;
 
-      if (candidate.reason == 'token direct') {
-        score += 50;
+      if (candidate.reason.startsWith('token direct')) {
+        if (candidate.reason.contains('corrigés')) {
+          score += 35; // moins fiable : caractères corrigés automatiquement
+        } else {
+          score += 50;
+          if (candidate.reason.contains('format connu')) score += 15;
+        }
       } else {
         if (elements.any((e) => e.isCurrencySymbol)) score += 40;
 
@@ -261,6 +319,10 @@ class PriceDetector {
           }
           final verticalGap = (euros.center.dy - cents.center.dy).abs();
           if (verticalGap < euros.height * 1.5) score += 10;
+
+          // Même taille, même ligne (ex : "8 99 €") : signal fiable même
+          // sans différence de police, on lui donne aussi du crédit.
+          if (_isSameLineSameSize(euros, cents)) score += 15;
         }
       }
 
@@ -271,6 +333,23 @@ class PriceDetector {
 
       candidate.score = score;
     }
+  }
+
+  /// Détecte le cas "8 99 €" : deux nombres de taille comparable, dont les
+  /// hauteurs se chevauchent fortement (même ligne visuelle), séparés
+  /// seulement par un espace — sans différence de taille de police ni
+  /// décalage vertical notable.
+  bool _isSameLineSameSize(PriceElement euros, PriceElement cents) {
+    final overlapTop = math.max(euros.top, cents.top);
+    final overlapBottom = math.min(euros.bottom, cents.bottom);
+    final overlap = math.max(0.0, overlapBottom - overlapTop);
+    final smallerHeight = math.min(euros.height, cents.height);
+    if (smallerHeight <= 0) return false;
+
+    final verticalOverlapRatio = overlap / smallerHeight;
+    final sizeRatio = cents.estimatedFontSize / euros.estimatedFontSize;
+
+    return verticalOverlapRatio > 0.6 && sizeRatio > 0.7 && sizeRatio < 1.3;
   }
 
   Offset _averageCenter(List<PriceElement> elements) {

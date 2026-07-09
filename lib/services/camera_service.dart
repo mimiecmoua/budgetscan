@@ -13,9 +13,11 @@ class CameraService {
   Future<void> initialize(List<CameraDescription> cameras) async {
     controller = CameraController(
       cameras.first,
-      // Haute résolution : nécessaire pour que l'OCR dispose de suffisamment
-      // de détail sur le prix après crop. À comparer avec `veryHigh` sur
-      // Samsung A13 (compromis qualité / latence / taille de fichier).
+      // Retour à `high` après test : les cas difficiles du jour (0€79,
+      // 11€09) ont été résolus par le nettoyage des confusions OCR
+      // (cleanedDigitsOnly), pas par la résolution de capture. `veryHigh`
+      // ralentissait sans bénéfice prouvé — à retester plus tard si de
+      // nouveaux cas d'échec semblent liés à un manque de détail brut.
       ResolutionPreset.high,
       enableAudio: false,
     );

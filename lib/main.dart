@@ -53,7 +53,7 @@ class LensScreen extends StatefulWidget {
   _LensScreenState createState() => _LensScreenState();
 }
 
-class _LensScreenState extends State<LensScreen> {
+class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   // --- Services du pipeline (chacun isolé et remplaçable indépendamment) ---
   final CameraService cameraService = CameraService();
   final CropService cropService = CropService();
@@ -86,8 +86,29 @@ class _LensScreenState extends State<LensScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     WakelockPlus.enable();
     _initCamera();
+  }
+
+  /// La caméra doit être libérée quand l'app passe en arrière-plan (sinon
+  /// le capteur reste verrouillé par l'app même invisible), et
+  /// ré-initialisée au retour — sans ça, l'écran caméra reste noir après
+  /// être revenu d'une autre app (mail, etc.).
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (cameraService.controller == null ||
+        !cameraService.controller!.value.isInitialized) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused) {
+      cameraService.dispose();
+      setState(() => isCameraReady = false);
+    } else if (state == AppLifecycleState.resumed) {
+      _initCamera();
+    }
   }
 
   Future<void> _initCamera() async {
@@ -228,6 +249,16 @@ class _LensScreenState extends State<LensScreen> {
       '🔎 Éléments retenus : ${result.elementsInZone} '
       '(${result.elementsRejectedOutsideZone} rejetés hors zone)',
     );
+
+    // Détail brut de ce que l'OCR a réellement lu (texte + position),
+    // indispensable pour comprendre POURQUOI un prix visible à l'écran
+    // n'a pas été reconstruit — sans ça on ne peut que deviner.
+    if (result.retainedElements.isNotEmpty) {
+      buffer.writeln('--- Éléments OCR bruts ---');
+      for (final element in result.retainedElements) {
+        buffer.writeln('  $element');
+      }
+    }
 
     if (result.candidates.isEmpty) {
       buffer.writeln('Aucun candidat de prix trouvé.');
@@ -549,6 +580,7 @@ class _LensScreenState extends State<LensScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     WakelockPlus.disable();
     cameraService.dispose();
     ocrService.dispose();
