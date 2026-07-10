@@ -22,7 +22,6 @@ late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  cameras = await availableCameras();
   runApp(const BudgetscanApp());
 }
 
@@ -117,6 +116,7 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
       setState(() => detectedText = 'Permission refusée');
       return;
     }
+    cameras = await availableCameras();
     await cameraService.initialize(cameras);
     if (!mounted) return;
     setState(() => isCameraReady = true);
