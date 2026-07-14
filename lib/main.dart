@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui';
@@ -21,6 +22,21 @@ import 'services/price_detector.dart';
 import 'theme/app_theme.dart';
 
 late List<CameraDescription> cameras;
+
+/// Fonction "top-level" (hors classe) : requis par `compute()`. Réduit la
+/// photo complète à une miniature (plus grande dimension ramenée à 300px)
+/// et compressée — c'est tout ce dont l'historique a besoin, puisqu'elle
+/// n'est jamais affichée qu'en petit. Remplace le stockage de la photo en
+/// pleine résolution caméra, gardée indéfiniment pour rien.
+Uint8List _makeThumbnail(img.Image source) {
+  final resized = img.copyResize(
+    source,
+    width: source.width >= source.height ? 300 : null,
+    height: source.width >= source.height ? null : 300,
+    interpolation: img.Interpolation.average,
+  );
+  return img.encodeJpg(resized, quality: 80);
+}
 
 /// Fonction "top-level" (hors classe) : requis par `compute()`, qui doit
 /// pouvoir l'envoyer telle quelle à l'isolate d'arrière-plan. Qualité 85
@@ -165,6 +181,14 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
         throw Exception('Zone de scan introuvable (rectangle non posé)');
       }
 
+      // 2bis. Miniature compressée pour l'historique — on n'a jamais
+      // besoin de la photo en pleine résolution caméra une fois le crop
+      // fait, seulement d'un aperçu visuel pour "s'y retrouver" plus
+      // tard. On génère cette miniature maintenant (fullImage est encore
+      // en mémoire), puis on supprime la photo d'origine du disque.
+      final thumbnailPath = await _saveThumbnail(fullImage);
+      unawaited(_deleteQuietly(xfile.path));
+
       // 3. Prétraitement : grayscale → autocontraste → sharpen → resize x2.
       final steps = await imageProcessor.process(cropped);
 
@@ -194,12 +218,12 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
         HapticFeedback.mediumImpact();
         setState(() {
           total += result.price!;
-          lastImagePath = xfile.path;
+          lastImagePath = thumbnailPath;
           products.add(
             ScannedProduct(
               label: 'Produit ${products.length + 1}',
               price: result.price!,
-              imagePath: xfile.path,
+              imagePath: thumbnailPath,
             ),
           );
           detectedText = '✅ ${result.price!.toStringAsFixed(2)} € ajouté !';
@@ -238,6 +262,31 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   /// depuis la mémoire). Si tu as besoin d'inspecter les étapes
   /// intermédiaires (crop, grayscale, sharpen) pour du debug visuel plus
   /// tard, on pourra les réactiver ponctuellement plutôt qu'à chaque scan.
+  /// Génère et sauvegarde une miniature compressée de la photo complète —
+  /// tout ce dont l'historique a besoin, au lieu de garder la photo en
+  /// pleine résolution caméra indéfiniment sur le disque.
+  Future<String> _saveThumbnail(img.Image fullImage) async {
+    final dir = await getTemporaryDirectory();
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    final path = '${dir.path}/thumb_$stamp.jpg';
+    final bytes = await compute(_makeThumbnail, fullImage);
+    await File(path).writeAsBytes(bytes);
+    return path;
+  }
+
+  /// Supprime un fichier sans bloquer ni faire planter le scan si ça
+  /// échoue (fichier déjà supprimé par le système, permissions...) — la
+  /// miniature suffit désormais, la photo d'origine n'est plus utile.
+  Future<void> _deleteQuietly(String path) async {
+    try {
+      final file = File(path);
+      if (await file.exists()) await file.delete();
+    } catch (_) {
+      // Pas grave : le système nettoiera le dossier temporaire de toute
+      // façon, on n'interrompt pas l'utilisateur pour ça.
+    }
+  }
+
   Future<String> _saveFinalImage(img.Image finalImage) async {
     final dir = await getTemporaryDirectory();
     final stamp = DateTime.now().millisecondsSinceEpoch;
