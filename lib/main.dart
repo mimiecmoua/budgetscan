@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -22,6 +23,7 @@ late List<CameraDescription> cameras;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  cameras = await availableCameras();
   runApp(const BudgetscanApp());
 }
 
@@ -116,7 +118,6 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
       setState(() => detectedText = 'Permission refusée');
       return;
     }
-    cameras = await availableCameras();
     await cameraService.initialize(cameras);
     if (!mounted) return;
     setState(() => isCameraReady = true);
@@ -157,20 +158,18 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
       }
 
       // 3. Prétraitement : grayscale → autocontraste → sharpen → resize x2.
-      final steps = imageProcessor.process(cropped);
+      final steps = await imageProcessor.process(cropped);
 
-      // 4. Sauvegarde des images de debug (photo, crop, grayscale, sharpen)
-      // pour pouvoir comprendre les erreurs de détection a posteriori.
-      final debugPaths = await _saveDebugImages(
-        original: fullImage,
-        cropped: cropped,
-        grayscale: steps.grayscale,
-        sharpened: steps.sharpened,
-        finalImage: steps.finalImage,
-      );
+      // 4. Sauvegarde de l'image finale uniquement — c'est la seule dont
+      // ML Kit a réellement besoin (il lit depuis un fichier, pas depuis
+      // la mémoire). Les 4 autres étapes (original/crop/grayscale/sharpen)
+      // ne sont jamais consultées en pratique et alourdissaient chaque
+      // scan de 4 écritures JPG inutiles sur le fil principal — cause
+      // probable des blocages "BudgetScan ne répond pas".
+      final finalImagePath = await _saveFinalImage(steps.finalImage);
 
       // 5. OCR sur l'image finale prétraitée.
-      final recognizedText = await ocrService.recognize(debugPaths['final']!);
+      final recognizedText = await ocrService.recognize(finalImagePath);
 
       // 6. Analyse spatiale des blocs + score + extraction du prix.
       final result = priceDetector.detect(
@@ -199,7 +198,26 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
         });
       } else {
         HapticFeedback.lightImpact();
-        setState(() => detectedText = 'Prix non détecté — réessaie');
+        // Zone trop sombre ET flash pas encore activé : c'est le cas où
+        // un simple "réessaie" n'aide pas l'utilisateur à comprendre quoi
+        // faire différemment — on suggère explicitement le flash.
+        final isTooDark = steps.averageBrightness < 90 && !flashOn;
+        setState(() {
+          detectedText = isTooDark
+              ? "💡 Zone sombre — essaie d'activer le flash"
+              : 'Prix non détecté — réessaie';
+        });
+        if (isTooDark && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                "Lumière insuffisante pour bien lire le prix. "
+                "Active le flash (icône en haut à gauche) et réessaie.",
+              ),
+              duration: Duration(seconds: 3),
+            ),
+          );
+        }
       }
     } catch (e) {
       setState(() => detectedText = 'Erreur : $e');
@@ -207,31 +225,21 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
     setState(() => isProcessing = false);
   }
 
-  /// Écrit sur disque chaque étape du pipeline (utile pour le debug visuel)
-  /// et retourne les chemins de fichiers correspondants.
-  Future<Map<String, String>> _saveDebugImages({
-    required img.Image original,
-    required img.Image cropped,
-    required img.Image grayscale,
-    required img.Image sharpened,
-    required img.Image finalImage,
-  }) async {
+  /// Écrit uniquement l'image finale prétraitée sur le disque — c'est le
+  /// seul fichier dont ML Kit a besoin (il lit depuis un chemin, pas
+  /// depuis la mémoire). Si tu as besoin d'inspecter les étapes
+  /// intermédiaires (crop, grayscale, sharpen) pour du debug visuel plus
+  /// tard, on pourra les réactiver ponctuellement plutôt qu'à chaque scan.
+  Future<String> _saveFinalImage(img.Image finalImage) async {
     final dir = await getTemporaryDirectory();
     final stamp = DateTime.now().millisecondsSinceEpoch;
-
-    Future<String> write(String suffix, img.Image image) async {
-      final path = '${dir.path}/scan_${stamp}_$suffix.jpg';
-      await File(path).writeAsBytes(img.encodeJpg(image));
-      return path;
-    }
-
-    return {
-      'original': await write('original', original),
-      'crop': await write('crop', cropped),
-      'grayscale': await write('grayscale', grayscale),
-      'sharpen': await write('sharpen', sharpened),
-      'final': await write('final', finalImage),
-    };
+    final path = '${dir.path}/scan_$stamp.jpg';
+    // encodeJpg est un calcul intensif — déplacé sur un isolate séparé
+    // pour ne pas geler l'affichage pendant l'encodage, comme pour le
+    // reste du prétraitement d'image.
+    final bytes = await compute(img.encodeJpg, finalImage);
+    await File(path).writeAsBytes(bytes);
+    return path;
   }
 
   /// Affiche dans la console le détail de la détection, ET ajoute un

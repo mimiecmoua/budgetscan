@@ -12,8 +12,11 @@ class PriceValidator {
     "l'unité",
   ];
 
-  /// Un prix plausible est strictement positif et inférieur à 1000 €.
-  bool _isPlausibleRange(double price) => price > 0 && price < 1000;
+  /// Un prix plausible est strictement positif et inférieur à 20 000 €
+  /// (couvre l'électroménager, les meubles, la bijouterie... tout en
+  /// restant nettement sous la plage des codes-barres/références, déjà
+  /// écartés séparément par [_looksLikeJunkNumber]).
+  bool _isPlausibleRange(double price) => price > 0 && price < 20000;
 
   /// Rejette les nombres bruts trop longs (codes-barres, références) ou
   /// composés d'un seul chiffre répété (ex : 111111, 987654 étant un cas

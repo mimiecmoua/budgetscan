@@ -55,13 +55,13 @@ class PriceElement {
   /// Version tolérante de [isPureDigits] : accepte aussi un nombre isolé
   /// mal lu à cause d'une confusion OCR classique (la lettre "O" pour le
   /// chiffre "0", "l"/"I" pour "1"), ou d'un fragment de symbole parasite
-  /// resté collé ("o`" au lieu de "0") — utile quand ML Kit sépare bien
-  /// les deux nombres d'un prix, mais mélit l'un d'eux comme une lettre ou
-  /// laisse un débris de ponctuation. Retourne la version corrigée si
-  /// exploitable, sinon `null`.
+  /// resté collé ("o`" au lieu de "0", "]43" au lieu de "43") — utile
+  /// quand ML Kit sépare bien les deux nombres d'un prix, mais mélit l'un
+  /// d'eux comme une lettre ou laisse un débris de ponctuation. Retourne
+  /// la version corrigée si exploitable, sinon `null`.
   String? get normalizedDigits {
     final cleaned = text
-        .replaceAll(RegExp(r"[°'`ʻ´]"), '')
+        .replaceAll(RegExp(r"[°'`ʻ´\[\]()]"), '')
         .replaceAll(RegExp(r'[oO]'), '0')
         .replaceAll(RegExp(r'[lI]'), '1');
     return RegExp(r'^\d{1,3}$').hasMatch(cleaned) ? cleaned : null;
@@ -70,20 +70,21 @@ class PriceElement {
   /// Tente de corriger les confusions OCR classiques rencontrées quand un
   /// petit exposant (€, virgule) fusionne avec les chiffres au lieu
   /// d'être ignoré : la lettre "o"/"O" est presque toujours un "0" mal lu,
-  /// "l"/"I" un "1" mal lu, et les apostrophes/guillemets courbes/degrés
-  /// parasites remplacent souvent le symbole fondu. Ex : "o`79" → "079",
-  /// "1lo9" → "1109".
+  /// "l"/"I" un "1" mal lu, et les apostrophes/guillemets courbes/degrés/
+  /// crochets parasites remplacent souvent le symbole fondu. Ex :
+  /// "o`79" → "079", "1lo9" → "1109", "199o0" → "19900" (= 199,00€).
   ///
   /// Ne retourne un résultat que si, une fois nettoyé, le token est un
-  /// nombre pur de 3 ou 4 chiffres (sinon on risque de corrompre un vrai
+  /// nombre pur de 3 à 5 chiffres (sinon on risque de corrompre un vrai
   /// mot) — jamais utilisé pour des tokens qui ne ressemblent déjà pas à
-  /// un prix fusionné.
+  /// un prix fusionné. 5 chiffres couvre les prix à 3 chiffres d'euros
+  /// fusionnés avec 2 chiffres de centimes (ex : 199,00€).
   String? get cleanedDigitsOnly {
     final cleaned = text
-        .replaceAll(RegExp(r"[°'`ʻ´]"), '')
+        .replaceAll(RegExp(r"[°'`ʻ´\[\]()]"), '')
         .replaceAll(RegExp(r'[oO]'), '0')
         .replaceAll(RegExp(r'[lI]'), '1');
-    return RegExp(r'^\d{3,4}$').hasMatch(cleaned) ? cleaned : null;
+    return RegExp(r'^\d{3,5}$').hasMatch(cleaned) ? cleaned : null;
   }
 
   @override
