@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui';
 
 import 'package:camera/camera.dart';
@@ -20,6 +21,13 @@ import 'services/price_detector.dart';
 import 'theme/app_theme.dart';
 
 late List<CameraDescription> cameras;
+
+/// Fonction "top-level" (hors classe) : requis par `compute()`, qui doit
+/// pouvoir l'envoyer telle quelle à l'isolate d'arrière-plan. Qualité 85
+/// plutôt que 100 : cette image ne sert qu'à l'OCR, jamais affichée.
+Uint8List _encodeJpgAt85(img.Image image) {
+  return img.encodeJpg(image, quality: 85);
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -234,10 +242,11 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
     final dir = await getTemporaryDirectory();
     final stamp = DateTime.now().millisecondsSinceEpoch;
     final path = '${dir.path}/scan_$stamp.jpg';
-    // encodeJpg est un calcul intensif — déplacé sur un isolate séparé
-    // pour ne pas geler l'affichage pendant l'encodage, comme pour le
-    // reste du prétraitement d'image.
-    final bytes = await compute(img.encodeJpg, finalImage);
+    // Qualité 85 plutôt que 100 (valeur par défaut) : cette image ne sert
+    // qu'à l'OCR, jamais affichée à l'utilisateur — inutile de payer le
+    // coût d'encodage d'une qualité photo pour de la simple lecture de
+    // caractères. Encodage toujours déplacé sur un isolate séparé.
+    final bytes = await compute(_encodeJpgAt85, finalImage);
     await File(path).writeAsBytes(bytes);
     return path;
   }
