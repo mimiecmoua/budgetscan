@@ -303,7 +303,13 @@ class PriceDetector {
 
       if (candidate.reason.startsWith('token direct')) {
         if (candidate.reason.contains('corrigés')) {
-          score += 35; // moins fiable : caractères corrigés automatiquement
+          // Un prix à 3 chiffres d'euros (donc 5 chiffres fusionnés à
+          // l'origine, ex : "34500" → 345,00€) ressemble beaucoup à un
+          // code postal ou une référence produit — vu en conditions
+          // réelles (34500 = code postal de Béziers, confondu un instant
+          // avec un prix). On le score plus bas par prudence, sans
+          // l'interdire complètement.
+          score += candidate.value >= 100 ? 20 : 35;
         } else {
           score += 50;
           if (candidate.reason.contains('format connu')) score += 15;

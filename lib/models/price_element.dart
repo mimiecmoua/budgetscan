@@ -71,8 +71,10 @@ class PriceElement {
   /// petit exposant (€, virgule) fusionne avec les chiffres au lieu
   /// d'être ignoré : la lettre "o"/"O" est presque toujours un "0" mal lu,
   /// "l"/"I" un "1" mal lu, et les apostrophes/guillemets courbes/degrés/
-  /// crochets parasites remplacent souvent le symbole fondu. Ex :
-  /// "o`79" → "079", "1lo9" → "1109", "199o0" → "19900" (= 199,00€).
+  /// crochets/points-virgules parasites remplacent souvent le symbole
+  /// fondu. Ex : "o`79" → "079", "1lo9" → "1109", "199o0" → "19900"
+  /// (= 199,00€), "339." → "339" (= 3,39€, le petit exposant des
+  /// centimes n'a laissé qu'un point parasite derrière lui).
   ///
   /// Ne retourne un résultat que si, une fois nettoyé, le token est un
   /// nombre pur de 3 à 5 chiffres (sinon on risque de corrompre un vrai
@@ -81,7 +83,7 @@ class PriceElement {
   /// fusionnés avec 2 chiffres de centimes (ex : 199,00€).
   String? get cleanedDigitsOnly {
     final cleaned = text
-        .replaceAll(RegExp(r"[°'`ʻ´\[\]()]"), '')
+        .replaceAll(RegExp(r"[°'`ʻ´\[\]().,]"), '')
         .replaceAll(RegExp(r'[oO]'), '0')
         .replaceAll(RegExp(r'[lI]'), '1');
     return RegExp(r'^\d{3,5}$').hasMatch(cleaned) ? cleaned : null;

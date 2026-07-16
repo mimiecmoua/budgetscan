@@ -108,6 +108,11 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   static const double scanBoxWidth = 420;
   static const double scanBoxHeight = 240;
 
+  /// Hauteur maximale que peut atteindre le panneau du bas — partagée
+  /// avec le calcul de position du rectangle, pour qu'ils restent
+  /// toujours cohérents entre eux (jamais de chevauchement possible).
+  static const double _panelMaxHeight = 360;
+
   @override
   void initState() {
     super.initState();
@@ -212,7 +217,13 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
         ),
       );
 
-      _logDetection(result);
+      // Le numéro de produit est calculé ici, avant le log, pour que le
+      // journal affiche "Produit 3" au lieu de juste l'heure — plus
+      // facile de faire le lien avec le panier. Reste `null` si aucun
+      // prix n'a été trouvé (pas de produit ajouté dans ce cas).
+      final productLabel =
+          result.price != null ? 'Produit ${products.length + 1}' : null;
+      _logDetection(result, productLabel: productLabel);
 
       if (result.price != null) {
         HapticFeedback.mediumImpact();
@@ -221,7 +232,7 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
           lastImagePath = thumbnailPath;
           products.add(
             ScannedProduct(
-              label: 'Produit ${products.length + 1}',
+              label: productLabel!,
               price: result.price!,
               imagePath: thumbnailPath,
             ),
@@ -304,13 +315,20 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   /// rapport horodaté au journal de session — consultable directement sur
   /// le téléphone via le bouton "Debug", sans avoir besoin de la console
   /// VSCode (utile en magasin). Le journal s'accumule scan après scan.
-  void _logDetection(PriceDetectionResult result) {
+  ///
+  /// [productLabel] : "Produit N" si un prix a été trouvé (fait le lien
+  /// avec le panier), sinon `null` pour un scan raté.
+  void _logDetection(PriceDetectionResult result, {String? productLabel}) {
     final buffer = StringBuffer();
     final now = TimeOfDay.now();
     final timestamp =
         '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
 
-    buffer.writeln('=== Scan $timestamp ===');
+    buffer.writeln(
+      productLabel != null
+          ? '=== $productLabel — $timestamp ==='
+          : '=== Scan $timestamp (non détecté) ===',
+    );
     buffer.writeln(
       '🔎 Éléments retenus : ${result.elementsInZone} '
       '(${result.elementsRejectedOutsideZone} rejetés hors zone)',
@@ -364,92 +382,125 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.transparent,
-      builder: (context) => ClipRRect(
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-        child: BackdropFilter(
-          filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
-          child: Container(
-            height: MediaQuery.of(context).size.height * 0.6,
-            decoration: BoxDecoration(
-              color: const Color(0xF20A0F1E),
-              borderRadius: const BorderRadius.vertical(
-                top: Radius.circular(28),
-              ),
-              border: const Border(
-                top: BorderSide(color: AppColors.glassBorder),
-              ),
-            ),
-            child: Column(
-              children: [
-                Container(
-                  margin: const EdgeInsets.only(top: 10),
-                  width: 40,
-                  height: 4,
-                  decoration: BoxDecoration(
-                    gradient: AppColors.primaryGradient,
-                    borderRadius: BorderRadius.circular(4),
-                  ),
+      // isScrollControlled : autorise le panneau à dépasser la moitié
+      // d'écran par défaut — nécessaire pour DraggableScrollableSheet.
+      isScrollControlled: true,
+      builder: (context) => DraggableScrollableSheet(
+        // Quasi plein écran d'entrée, redimensionnable entre 0.5 et 0.95
+        // en faisant glisser la poignée du haut.
+        initialChildSize: 0.92,
+        minChildSize: 0.5,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (context, scrollController) => ClipRRect(
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
+          child: BackdropFilter(
+            filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
+            child: Container(
+              decoration: BoxDecoration(
+                color: const Color(0xF20A0F1E),
+                borderRadius: const BorderRadius.vertical(
+                  top: Radius.circular(28),
                 ),
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: GradientText(
-                    'Historique de la session',
-                    style: AppText.display(size: 17),
-                  ),
+                border: const Border(
+                  top: BorderSide(color: AppColors.glassBorder),
                 ),
-                Expanded(
-                  child: products.isEmpty
-                      ? Center(
-                          child: Text(
-                            'Aucun scan cette session',
-                            style: AppText.body(color: AppColors.textMuted),
-                          ),
-                        )
-                      : ListView.builder(
-                          padding: const EdgeInsets.symmetric(horizontal: 12),
-                          itemCount: products.length,
-                          itemBuilder: (context, index) {
-                            final p = products[index];
-                            return Container(
-                              margin: const EdgeInsets.symmetric(vertical: 4),
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                              ),
-                              decoration: glassDecoration(radius: 14),
-                              child: ListTile(
-                                leading: File(p.imagePath).existsSync()
-                                    ? ClipRRect(
-                                        borderRadius: BorderRadius.circular(10),
-                                        child: Image.file(
-                                          File(p.imagePath),
-                                          width: 44,
-                                          height: 44,
-                                          fit: BoxFit.cover,
-                                        ),
-                                      )
-                                    : const Icon(
-                                        Icons.image_outlined,
+              ),
+              child: Column(
+                children: [
+                  Container(
+                    margin: const EdgeInsets.only(top: 10),
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      gradient: AppColors.primaryGradient,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: GradientText(
+                      'Historique (${products.length} scan'
+                      '${products.length > 1 ? 's' : ''})',
+                      style: AppText.display(size: 17),
+                    ),
+                  ),
+                  Expanded(
+                    child: products.isEmpty
+                        ? Center(
+                            child: Text(
+                              'Aucun scan cette session',
+                              style:
+                                  AppText.body(color: AppColors.textMuted),
+                            ),
+                          )
+                        // Grille plutôt que liste : 3 colonnes, bien plus
+                        // dense — on voit d'un coup d'œil beaucoup plus de
+                        // produits qu'avec une ligne par produit. Le
+                        // scrollController vient du DraggableScrollableSheet
+                        // : plus de conflit avec le geste de fermeture.
+                        : GridView.builder(
+                            controller: scrollController,
+                            padding: const EdgeInsets.all(12),
+                            gridDelegate:
+                                const SliverGridDelegateWithFixedCrossAxisCount(
+                              crossAxisCount: 3,
+                              crossAxisSpacing: 10,
+                              mainAxisSpacing: 10,
+                              childAspectRatio: 0.68,
+                            ),
+                            itemCount: products.length,
+                            itemBuilder: (context, index) {
+                              final p = products[index];
+                              return Container(
+                                padding: const EdgeInsets.all(8),
+                                decoration: glassDecoration(radius: 14),
+                                child: Column(
+                                  crossAxisAlignment:
+                                      CrossAxisAlignment.center,
+                                  children: [
+                                    Expanded(
+                                      child: ClipRRect(
+                                        borderRadius:
+                                            BorderRadius.circular(10),
+                                        child: File(p.imagePath).existsSync()
+                                            ? Image.file(
+                                                File(p.imagePath),
+                                                width: double.infinity,
+                                                fit: BoxFit.cover,
+                                              )
+                                            : const Icon(
+                                                Icons.image_outlined,
+                                                color: AppColors.textMuted,
+                                              ),
+                                      ),
+                                    ),
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      p.label,
+                                      style: AppText.body(
+                                        size: 11,
                                         color: AppColors.textMuted,
                                       ),
-                                title: Text(
-                                  p.label,
-                                  style: AppText.body(
-                                    color: AppColors.textPrimary,
-                                  ),
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                    const SizedBox(height: 2),
+                                    GradientText(
+                                      '${p.price.toStringAsFixed(2)} €',
+                                      style: AppText.mono(
+                                        size: 14,
+                                        weight: FontWeight.w700,
+                                      ),
+                                    ),
+                                  ],
                                 ),
-                                trailing: GradientText(
-                                  '${p.price.toStringAsFixed(2)} €',
-                                  style: AppText.mono(
-                                    size: 15,
-                                    weight: FontWeight.w700,
-                                  ),
-                                ),
-                              ),
-                            );
-                          },
-                        ),
-                ),
-              ],
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -750,12 +801,25 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
 
           // Zone de scan — coins néon façon scanner high-tech
           // (seule la zone à l'intérieur est analysée).
-          Center(
-            child: SizedBox(
-              key: _scanBoxKey,
-              width: scanBoxWidth,
-              height: scanBoxHeight,
-              child: CustomPaint(painter: _ScanCornersPainter()),
+          // Position calculée à partir de la hauteur réelle de l'écran
+          // (et non un chiffre fixe deviné) : garantit que le rectangle
+          // reste toujours au-dessus de la hauteur MAXIMALE que peut
+          // atteindre le panneau du bas, quel que soit l'appareil.
+          Positioned(
+            top: (MediaQuery.of(context).size.height -
+                    _panelMaxHeight -
+                    scanBoxHeight -
+                    24)
+                .clamp(110.0, double.infinity),
+            left: 0,
+            right: 0,
+            child: Center(
+              child: SizedBox(
+                key: _scanBoxKey,
+                width: scanBoxWidth,
+                height: scanBoxHeight,
+                child: CustomPaint(painter: _ScanCornersPainter()),
+              ),
             ),
           ),
 
@@ -771,7 +835,8 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
               child: BackdropFilter(
                 filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
                 child: Container(
-                  constraints: const BoxConstraints(maxHeight: 360),
+                  constraints:
+                      const BoxConstraints(maxHeight: _panelMaxHeight),
                   decoration: BoxDecoration(
                     color: const Color(0xE60A0F1E),
                     borderRadius: const BorderRadius.vertical(
@@ -809,7 +874,12 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
                       ),
                       if (products.isNotEmpty)
                         SizedBox(
-                          height: 104,
+                          // Hauteur proportionnelle au nombre réel de
+                          // produits (jusqu'à 104 max, ~2 lignes visibles
+                          // avant de devoir scroller) — plus de bande
+                          // vide réservée pour rien quand il n'y a qu'un
+                          // ou deux produits dans le panier.
+                          height: (products.length * 56.0).clamp(0.0, 104.0),
                           child: ListView.builder(
                             itemCount: products.length,
                             itemBuilder: (context, index) {
