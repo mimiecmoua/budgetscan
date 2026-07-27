@@ -103,15 +103,33 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   // du rectangle bleu à l'écran (RenderBox → rectangle englobant → crop).
   final GlobalKey _scanBoxKey = GlobalKey();
 
+  // GlobalKey posée sur le panneau du bas, pour MESURER sa hauteur réelle
+  // après chaque frame plutôt que de la deviner. Un calcul basé sur une
+  // supposition (hauteur d'écran, hauteur max du panneau) peut se tromper
+  // selon l'appareil ; mesurer la vraie taille rendue ne se trompe jamais.
+  final GlobalKey _panelKey = GlobalKey();
+
+  // Hauteur mesurée du panneau, mise à jour après chaque frame. Valeur de
+  // départ prudente (360) tant que la première mesure n'a pas eu lieu.
+  double _panelHeight = 360;
+
   // Rectangle agrandi (ancien : 300x180) pour laisser plus de marge autour
   // du prix et limiter les coupures de texte lors du crop.
   static const double scanBoxWidth = 420;
   static const double scanBoxHeight = 240;
 
-  /// Hauteur maximale que peut atteindre le panneau du bas — partagée
-  /// avec le calcul de position du rectangle, pour qu'ils restent
-  /// toujours cohérents entre eux (jamais de chevauchement possible).
-  static const double _panelMaxHeight = 360;
+  /// Après chaque frame, remesure la hauteur réelle du panneau du bas et
+  /// ajuste la position du rectangle en conséquence — au lieu de deviner,
+  /// on constate. Ne redéclenche un rebuild que si la valeur a vraiment
+  /// changé (évite toute boucle infinie).
+  void _measurePanelHeight(Duration _) {
+    final renderObject = _panelKey.currentContext?.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return;
+    final measured = renderObject.size.height;
+    if ((measured - _panelHeight).abs() > 1 && mounted) {
+      setState(() => _panelHeight = measured);
+    }
+  }
 
   @override
   void initState() {
@@ -706,6 +724,11 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
+    // Remesure la hauteur réelle du panneau après CE frame (dès qu'il est
+    // posé à l'écran) — capture les changements dus à l'ajout/suppression
+    // de produits, à l'apparition du bandeau "prix ajouté", etc.
+    WidgetsBinding.instance.addPostFrameCallback(_measurePanelHeight);
+
     if (!isCameraReady || cameraService.controller == null) {
       return Scaffold(
         backgroundColor: AppColors.bgBottom,
@@ -801,13 +824,13 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
 
           // Zone de scan — coins néon façon scanner high-tech
           // (seule la zone à l'intérieur est analysée).
-          // Position calculée à partir de la hauteur réelle de l'écran
-          // (et non un chiffre fixe deviné) : garantit que le rectangle
-          // reste toujours au-dessus de la hauteur MAXIMALE que peut
-          // atteindre le panneau du bas, quel que soit l'appareil.
+          // Position calculée à partir de _panelHeight — la hauteur RÉELLE
+          // mesurée du panneau du bas (cf. _measurePanelHeight), pas une
+          // supposition. Garantit qu'il ne peut plus jamais être recouvert,
+          // quel que soit l'appareil ou le nombre de produits affichés.
           Positioned(
             top: (MediaQuery.of(context).size.height -
-                    _panelMaxHeight -
+                    _panelHeight -
                     scanBoxHeight -
                     24)
                 .clamp(110.0, double.infinity),
@@ -835,8 +858,8 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
               child: BackdropFilter(
                 filter: ImageFilter.blur(sigmaX: 24, sigmaY: 24),
                 child: Container(
-                  constraints:
-                      const BoxConstraints(maxHeight: _panelMaxHeight),
+                  key: _panelKey,
+                  constraints: const BoxConstraints(maxHeight: 360),
                   decoration: BoxDecoration(
                     color: const Color(0xE60A0F1E),
                     borderRadius: const BorderRadius.vertical(

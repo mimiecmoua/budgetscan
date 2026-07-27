@@ -141,7 +141,19 @@ class PriceDetector {
     }
 
     _scoreCandidates(candidates, imageSize);
-    candidates.sort((a, b) => b.score.compareTo(a.score));
+    // En cas d'égalité de score, le tri de Dart n'est pas garanti stable
+    // — un token déjà complet ("13.99") doit toujours l'emporter sur un
+    // assemblage géométrique de plusieurs éléments, même à score égal :
+    // c'est structurellement une lecture plus sûre qu'une reconstruction.
+    // Vu en conditions réelles : "13,99€" et un "760,60€" assemblé à
+    // partir de fragments non liés, à égalité parfaite (score 90/90).
+    candidates.sort((a, b) {
+      final scoreDiff = b.score.compareTo(a.score);
+      if (scoreDiff != 0) return scoreDiff;
+      final aIsDirect = a.reason.startsWith('token direct') ? 0 : 1;
+      final bIsDirect = b.reason.startsWith('token direct') ? 0 : 1;
+      return aIsDirect.compareTo(bIsDirect);
+    });
 
     for (final candidate in candidates) {
       final sourceText = candidate.sourceElements.map((e) => e.text).join(' ');
