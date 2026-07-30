@@ -116,6 +116,12 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   // Rectangle agrandi (ancien : 300x180) pour laisser plus de marge autour
   // du prix et limiter les coupures de texte lors du crop.
   static const double scanBoxWidth = 420;
+
+  /// En dessous de ce score, on ne fait plus confiance silencieusement :
+  /// on demande une confirmation avant d'ajouter le prix au panier. Vu en
+  /// conditions réelles (Lidl) : deux scans à score 35 et 65 ont ajouté un
+  /// prix barré/faux par élimination, sans jamais prévenir l'utilisatrice.
+  static const int _confidenceThreshold = 70;
   static const double scanBoxHeight = 240;
 
   /// Après chaque frame, remesure la hauteur réelle du panneau du bas et
@@ -244,19 +250,21 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
       _logDetection(result, productLabel: productLabel);
 
       if (result.price != null) {
-        HapticFeedback.mediumImpact();
-        setState(() {
-          total += result.price!;
-          lastImagePath = thumbnailPath;
-          products.add(
-            ScannedProduct(
-              label: productLabel!,
-              price: result.price!,
-              imagePath: thumbnailPath,
-            ),
+        final score = result.winningScore ?? 0;
+        if (score < _confidenceThreshold) {
+          // Score bas : on ne fait plus confiance aveuglément. On montre
+          // ce qui a été trouvé et on demande une confirmation en un tap
+          // — ou une correction manuelle si le prix est faux — plutôt
+          // que d'ajouter silencieusement un prix potentiellement erroné.
+          await _confirmLowConfidencePrice(
+            detectedPrice: result.price!,
+            score: score,
+            imagePath: thumbnailPath,
+            productLabel: productLabel!,
           );
-          detectedText = '✅ ${result.price!.toStringAsFixed(2)} € ajouté !';
-        });
+        } else {
+          _addProduct(result.price!, thumbnailPath, productLabel!);
+        }
       } else {
         HapticFeedback.lightImpact();
         // Zone trop sombre ET flash pas encore activé : c'est le cas où
@@ -284,6 +292,147 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
       setState(() => detectedText = 'Erreur : $e');
     }
     setState(() => isProcessing = false);
+  }
+
+  /// Ajoute effectivement un prix au panier — utilisé aussi bien pour un
+  /// scan à haute confiance (silencieux) que pour un prix confirmé ou
+  /// corrigé à la main après une demande de confirmation.
+  void _addProduct(double price, String imagePath, String productLabel) {
+    HapticFeedback.mediumImpact();
+    setState(() {
+      total += price;
+      lastImagePath = imagePath;
+      products.add(
+        ScannedProduct(
+          label: productLabel,
+          price: price,
+          imagePath: imagePath,
+        ),
+      );
+      detectedText = '✅ ${price.toStringAsFixed(2)} € ajouté !';
+    });
+  }
+
+  /// Filet de sécurité pour les scans à faible confiance : montre le prix
+  /// détecté et demande une confirmation en un tap, avec une option de
+  /// correction manuelle si le prix est faux. Ne bloque jamais la caméra
+  /// plus que nécessaire — l'utilisatrice choisit en 1-2 gestes.
+  Future<void> _confirmLowConfidencePrice({
+    required double detectedPrice,
+    required int score,
+    required String imagePath,
+    required String productLabel,
+  }) async {
+    final controller = TextEditingController(
+      text: detectedPrice.toStringAsFixed(2),
+    );
+    bool isEditing = false;
+
+    final confirmedPrice = await showDialog<double>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          backgroundColor: const Color(0xF20A0F1E),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(20),
+            side: const BorderSide(color: AppColors.glassBorder),
+          ),
+          title: Text(
+            isEditing ? 'Corriger le prix' : 'Prix peu certain',
+            style: AppText.display(size: 16),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (File(imagePath).existsSync())
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: ClipRRect(
+                    borderRadius: BorderRadius.circular(10),
+                    child: Image.file(
+                      File(imagePath),
+                      height: 90,
+                      fit: BoxFit.cover,
+                    ),
+                  ),
+                ),
+              if (isEditing)
+                TextField(
+                  controller: controller,
+                  autofocus: true,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  style: AppText.display(size: 22),
+                  decoration: InputDecoration(
+                    suffixText: '€',
+                    suffixStyle: AppText.body(color: AppColors.textSecondary),
+                    enabledBorder: const UnderlineInputBorder(
+                      borderSide: BorderSide(color: AppColors.glassBorder),
+                    ),
+                  ),
+                )
+              else ...[
+                GradientText(
+                  '${detectedPrice.toStringAsFixed(2)} €',
+                  style: AppText.display(size: 30),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  'Confiance : $score/100',
+                  style: AppText.body(color: AppColors.textMuted, size: 13),
+                ),
+              ],
+            ],
+          ),
+          actions: isEditing
+              ? [
+                  TextButton(
+                    onPressed: () => Navigator.pop(context),
+                    child: Text(
+                      'Annuler',
+                      style: AppText.body(color: AppColors.textMuted),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () {
+                      final parsed = double.tryParse(
+                        controller.text.replaceAll(',', '.'),
+                      );
+                      if (parsed != null) Navigator.pop(context, parsed);
+                    },
+                    child: Text(
+                      'Valider',
+                      style: AppText.body(color: AppColors.emerald),
+                    ),
+                  ),
+                ]
+              : [
+                  TextButton(
+                    onPressed: () => setDialogState(() => isEditing = true),
+                    child: Text(
+                      '✏️ Corriger',
+                      style: AppText.body(color: AppColors.gold),
+                    ),
+                  ),
+                  TextButton(
+                    onPressed: () => Navigator.pop(context, detectedPrice),
+                    child: Text(
+                      '✓ Confirmer',
+                      style: AppText.body(color: AppColors.emerald),
+                    ),
+                  ),
+                ],
+        ),
+      ),
+    );
+
+    if (confirmedPrice != null) {
+      _addProduct(confirmedPrice, imagePath, productLabel);
+    } else {
+      setState(() => detectedText = 'Scan annulé — réessaie');
+    }
   }
 
   /// Écrit uniquement l'image finale prétraitée sur le disque — c'est le

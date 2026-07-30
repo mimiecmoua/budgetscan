@@ -19,12 +19,19 @@ class PriceDetectionResult {
   final int elementsRejectedOutsideZone;
   final List<PriceElement> retainedElements;
 
+  /// Score de confiance du candidat retenu (0-110 environ), ou `null` si
+  /// aucun prix n'a été trouvé. Sert de base au filet de sécurité
+  /// "confirmation en un tap" : un score bas déclenche une demande de
+  /// confirmation plutôt qu'un ajout silencieux au panier.
+  final int? winningScore;
+
   PriceDetectionResult({
     required this.price,
     required this.candidates,
     required this.elementsInZone,
     required this.elementsRejectedOutsideZone,
     this.retainedElements = const [],
+    this.winningScore,
   });
 }
 
@@ -164,6 +171,7 @@ class PriceDetector {
           elementsInZone: elementsInZone.length,
           elementsRejectedOutsideZone: rejectedCount,
           retainedElements: elementsInZone,
+          winningScore: candidate.score,
         );
       }
     }
@@ -347,7 +355,12 @@ class PriceDetector {
       final avgCenter = _averageCenter(elements);
       final distance = (avgCenter - center).distance;
       final proximity = 1 - (distance / (maxDistance == 0 ? 1 : maxDistance));
-      if (proximity > 0.6) score += 25;
+      // La proximité au centre sert à départager plusieurs candidats
+      // concurrents (le vrai prix contre un code postal, par exemple).
+      // S'il n'y a AUCUNE concurrence (un seul candidat dans toute la
+      // zone), un cadrage un peu excentré ne doit pas pénaliser un token
+      // par ailleurs parfaitement lisible — d'où le bonus systématique.
+      if (candidates.length == 1 || proximity > 0.6) score += 25;
 
       candidate.score = score;
     }

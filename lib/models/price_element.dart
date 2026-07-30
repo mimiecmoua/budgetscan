@@ -54,14 +54,15 @@ class PriceElement {
 
   /// Version tolérante de [isPureDigits] : accepte aussi un nombre isolé
   /// mal lu à cause d'une confusion OCR classique (la lettre "O" pour le
-  /// chiffre "0", "l"/"I" pour "1"), ou d'un fragment de symbole parasite
-  /// resté collé ("o`" au lieu de "0", "]43" au lieu de "43") — utile
-  /// quand ML Kit sépare bien les deux nombres d'un prix, mais mélit l'un
-  /// d'eux comme une lettre ou laisse un débris de ponctuation. Retourne
-  /// la version corrigée si exploitable, sinon `null`.
+  /// chiffre "0", "l"/"I" pour "1"), un fragment de symbole parasite resté
+  /// collé ("o`" au lieu de "0", "]43" au lieu de "43"), ou un point/une
+  /// virgule isolé devant les centimes (".99" au lieu de "99", vu chez
+  /// King Jouet où les centimes sont écrits ainsi, positionnés en dessous
+  /// du prix plutôt qu'à droite). Retourne la version corrigée si
+  /// exploitable, sinon `null`.
   String? get normalizedDigits {
     final cleaned = text
-        .replaceAll(RegExp(r"[°'`ʻ´\[\]()]"), '')
+        .replaceAll(RegExp(r'''[°'`ʻ´\[\]().,"]'''), '')
         .replaceAll(RegExp(r'[oO]'), '0')
         .replaceAll(RegExp(r'[lI]'), '1');
     return RegExp(r'^\d{1,3}$').hasMatch(cleaned) ? cleaned : null;
@@ -83,7 +84,7 @@ class PriceElement {
   /// fusionnés avec 2 chiffres de centimes (ex : 199,00€).
   String? get cleanedDigitsOnly {
     final cleaned = text
-        .replaceAll(RegExp(r"[°'`ʻ´\[\]().,]"), '')
+        .replaceAll(RegExp(r'''[°'`ʻ´\[\]().,"]'''), '')
         .replaceAll(RegExp(r'[oO]'), '0')
         .replaceAll(RegExp(r'[lI]'), '1');
     return RegExp(r'^\d{3,5}$').hasMatch(cleaned) ? cleaned : null;
