@@ -109,9 +109,17 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   // selon l'appareil ; mesurer la vraie taille rendue ne se trompe jamais.
   final GlobalKey _panelKey = GlobalKey();
 
+  // Même principe pour le header (bandeau du haut) : mesurer sa vraie
+  // hauteur permet de CENTRER le rectangle dans l'espace réellement
+  // disponible entre header et panneau, plutôt que de juste le coller
+  // au-dessus du panneau (ce qui laissait un grand vide en haut sur les
+  // écrans plus grands).
+  final GlobalKey _headerKey = GlobalKey();
+
   // Hauteur mesurée du panneau, mise à jour après chaque frame. Valeur de
   // départ prudente (360) tant que la première mesure n'a pas eu lieu.
   double _panelHeight = 360;
+  double _headerHeight = 90;
 
   // Rectangle agrandi (ancien : 300x180) pour laisser plus de marge autour
   // du prix et limiter les coupures de texte lors du crop.
@@ -124,17 +132,56 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   static const int _confidenceThreshold = 70;
   static const double scanBoxHeight = 240;
 
-  /// Après chaque frame, remesure la hauteur réelle du panneau du bas et
-  /// ajuste la position du rectangle en conséquence — au lieu de deviner,
-  /// on constate. Ne redéclenche un rebuild que si la valeur a vraiment
-  /// changé (évite toute boucle infinie).
+  /// Après chaque frame, remesure la hauteur réelle du header ET du
+  /// panneau, pour pouvoir centrer le rectangle dans l'espace qui reste
+  /// entre les deux — au lieu de deviner, on constate. Ne redéclenche un
+  /// rebuild que si une valeur a vraiment changé (évite toute boucle
+  /// infinie).
   void _measurePanelHeight(Duration _) {
-    final renderObject = _panelKey.currentContext?.findRenderObject();
-    if (renderObject is! RenderBox || !renderObject.hasSize) return;
-    final measured = renderObject.size.height;
-    if ((measured - _panelHeight).abs() > 1 && mounted) {
-      setState(() => _panelHeight = measured);
+    var changed = false;
+    double newPanelHeight = _panelHeight;
+    double newHeaderHeight = _headerHeight;
+
+    final panelBox = _panelKey.currentContext?.findRenderObject();
+    if (panelBox is RenderBox && panelBox.hasSize) {
+      final measured = panelBox.size.height;
+      if ((measured - _panelHeight).abs() > 1) {
+        newPanelHeight = measured;
+        changed = true;
+      }
     }
+
+    final headerBox = _headerKey.currentContext?.findRenderObject();
+    if (headerBox is RenderBox && headerBox.hasSize) {
+      final measured = headerBox.size.height;
+      if ((measured - _headerHeight).abs() > 1) {
+        newHeaderHeight = measured;
+        changed = true;
+      }
+    }
+
+    if (changed && mounted) {
+      setState(() {
+        _panelHeight = newPanelHeight;
+        _headerHeight = newHeaderHeight;
+      });
+    }
+  }
+
+  /// Centre le rectangle dans l'espace réellement disponible entre le bas
+  /// du header et le haut du panneau (tous deux mesurés). Une petite marge
+  /// de sécurité (8) est gardée de chaque côté, et le résultat est borné
+  /// pour ne jamais chevaucher ni l'un ni l'autre, même sur un très petit
+  /// écran où l'espace disponible serait plus court que le rectangle.
+  double _computeScanBoxTop(double screenHeight) {
+    const margin = 8.0;
+    final availableSpace = screenHeight - _headerHeight - _panelHeight;
+    final centeredTop =
+        _headerHeight + (availableSpace - scanBoxHeight) / 2;
+    final minTop = _headerHeight + margin;
+    final maxTop = screenHeight - _panelHeight - scanBoxHeight - margin;
+    if (maxTop < minTop) return minTop; // écran trop petit : on ne force pas
+    return centeredTop.clamp(minTop, maxTop);
   }
 
   @override
@@ -927,6 +974,7 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
             left: 0,
             right: 0,
             child: SafeArea(
+              key: _headerKey,
               child: Padding(
                 padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
                 child: ClipRRect(
@@ -973,16 +1021,12 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
 
           // Zone de scan — coins néon façon scanner high-tech
           // (seule la zone à l'intérieur est analysée).
-          // Position calculée à partir de _panelHeight — la hauteur RÉELLE
-          // mesurée du panneau du bas (cf. _measurePanelHeight), pas une
-          // supposition. Garantit qu'il ne peut plus jamais être recouvert,
-          // quel que soit l'appareil ou le nombre de produits affichés.
+          // Centré dans l'espace RÉEL restant entre le header et le
+          // panneau (tous deux mesurés, cf. _measurePanelHeight) — plutôt
+          // que simplement collé au-dessus du panneau, ce qui laissait un
+          // grand vide en haut sur les écrans plus grands.
           Positioned(
-            top: (MediaQuery.of(context).size.height -
-                    _panelHeight -
-                    scanBoxHeight -
-                    24)
-                .clamp(110.0, double.infinity),
+            top: _computeScanBoxTop(MediaQuery.of(context).size.height),
             left: 0,
             right: 0,
             child: Center(
@@ -1018,16 +1062,25 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
                       top: BorderSide(color: AppColors.glassBorder, width: 1),
                     ),
                   ),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      // Liseré dégradé décoratif (poignée du panneau).
-                      Container(
-                        margin: const EdgeInsets.only(top: 10),
-                        width: 40,
-                        height: 4,
-                        decoration: BoxDecoration(
-                          gradient: AppColors.primaryGradient,
+                  child: SafeArea(
+                    // Pousse le contenu au-dessus de la barre de
+                    // navigation système. Sans ça, le bouton photo peut
+                    // se retrouver collé/caché sous les boutons du
+                    // téléphone — ça dépend du mode de navigation
+                    // (gestes fins vs 3 boutons classiques) et varie
+                    // d'un appareil à l'autre (remarqué en changeant de
+                    // téléphone).
+                    top: false,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        // Liseré dégradé décoratif (poignée du panneau).
+                        Container(
+                          margin: const EdgeInsets.only(top: 10),
+                          width: 40,
+                          height: 4,
+                          decoration: BoxDecoration(
+                            gradient: AppColors.primaryGradient,
                           borderRadius: BorderRadius.circular(4),
                         ),
                       ),
@@ -1223,6 +1276,7 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
                         ),
                       ),
                     ],
+                  ),
                   ),
                 ),
               ),
