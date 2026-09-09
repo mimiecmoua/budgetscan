@@ -40,17 +40,37 @@ class PriceElement {
   static final RegExp _decimalToken = RegExp(r'^€?\d{1,3}[.,]\d{1,2}€?$');
   static final RegExp _euroSeparatorToken = RegExp(r'^\d{1,3}[€e]\d{2}$');
   static final RegExp _noCentsToken = RegExp(r'^€?\d{1,3},-€?$');
+  // Prix rond, juste un nombre suivi de € — vu chez Ikea (45€, 119€), sans
+  // virgule ni point du tout. Volontairement séparé de la reconstruction
+  // "3-5 chiffres = derniers 2 en centimes" (cleanedDigitsOnly) : ce
+  // raccourci aurait lu "119€" comme 1,19€, une erreur grossière — ici on
+  // sait explicitement qu'il n'y a pas de centimes, donc pas de calcul à
+  // deviner.
+  static final RegExp _wholeEuroToken = RegExp(r'^\d{1,3}€$');
 
   /// Token qui contient déjà un prix complet. Couvre :
   ///   - séparateur classique, avec ou sans € collé : "1,49", "12,40€", "€12.99"
   ///   - € utilisé comme séparateur décimal : "2€49", "5€99"
   ///   - prix rond, tiret pour les centimes : "4,-€" (= 4,00€)
+  ///   - prix rond, juste chiffres + € : "45€", "119€" (= 45,00€, 119,00€)
   /// C'est le cas le plus simple : ML Kit a réuni euros et centimes (et
   /// parfois le symbole €) dans un seul élément.
   bool get isDirectPriceToken =>
       _decimalToken.hasMatch(text) ||
       _euroSeparatorToken.hasMatch(text) ||
-      _noCentsToken.hasMatch(text);
+      _noCentsToken.hasMatch(text) ||
+      _wholeEuroToken.hasMatch(text);
+
+  /// Un fragment "99€" : des chiffres de centimes directement collés au
+  /// symbole €, sans espace ni exposant — vu chez Ikea, où le prix est
+  /// parfois éclaté en deux éléments séparés ("9" pour les euros, "99€"
+  /// pour les centimes+devise). Retourne les chiffres seuls si le motif
+  /// correspond, pour servir de candidat "centimes" dans la
+  /// reconstruction géométrique.
+  String? get centsFusedWithCurrency {
+    final match = RegExp(r'^(\d{1,2})€$').firstMatch(text);
+    return match?.group(1);
+  }
 
   /// Version tolérante de [isPureDigits] : accepte aussi un nombre isolé
   /// mal lu à cause d'une confusion OCR classique (la lettre "O" pour le

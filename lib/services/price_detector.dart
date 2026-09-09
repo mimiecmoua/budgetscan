@@ -223,10 +223,13 @@ class PriceDetector {
   List<ComposedPrice> _composeFromDigitPairs(List<PriceElement> elements) {
     // On indexe chaque élément par sa version "chiffres corrigés" plutôt
     // que son texte brut : un "0" lu comme la lettre "O" doit quand même
-    // pouvoir jouer le rôle du nombre "euros" dans la reconstruction.
+    // pouvoir jouer le rôle du nombre "euros" dans la reconstruction. On
+    // inclut aussi les fragments "centimes collés au €" (ex : "99€") vus
+    // chez Ikea, où le prix est parfois éclaté en "9" + "99€" plutôt que
+    // "9" + "99" + "€" séparés proprement.
     final digitElements = <PriceElement, String>{};
     for (final element in elements) {
-      final normalized = element.normalizedDigits;
+      final normalized = element.normalizedDigits ?? element.centsFusedWithCurrency;
       if (normalized != null) digitElements[element] = normalized;
     }
     final currencyElements =

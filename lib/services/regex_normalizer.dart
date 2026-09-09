@@ -24,6 +24,28 @@ class RegexNormalizer {
   double? extract(String rawText) {
     final cleaned = _cleanText(rawText);
 
+    // Format "centimes seuls" (ex : ",79" chez Lidl, quand le prix est
+    // inférieur à 1€ et que le "0" des euros n'est pas affiché du tout).
+    final centsOnly = RegExp(r'^[.,](\d{2})$').firstMatch(cleaned);
+    if (centsOnly != null) {
+      return double.tryParse('0.${centsOnly.group(1)}');
+    }
+
+    // Format "prix rond, tiret pour les centimes" (ex : "4,-€" = 4,00€).
+    final noCents = RegExp(r'^€?(\d{1,3}),-€?$').firstMatch(cleaned);
+    if (noCents != null) {
+      return double.tryParse('${noCents.group(1)}.00');
+    }
+
+    // Format "prix rond, juste chiffres + €" (ex : "45€" = 45,00€, "119€"
+    // = 119,00€, vu chez Ikea). Vérifié AVANT la boucle générique pour
+    // éviter que le motif "3 chiffres bruts" plus bas interprète par
+    // erreur "119€" comme "1,19€".
+    final wholeEuro = RegExp(r'^(\d{1,3})€$').firstMatch(cleaned);
+    if (wholeEuro != null) {
+      return double.tryParse('${wholeEuro.group(1)}.00');
+    }
+
     for (final pattern in _patterns) {
       final match = pattern.firstMatch(cleaned);
       if (match == null) continue;
