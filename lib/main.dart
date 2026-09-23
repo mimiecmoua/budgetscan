@@ -17,6 +17,8 @@ import 'models/scanned_product.dart';
 import 'services/camera_service.dart';
 import 'services/crop_service.dart';
 import 'services/image_processor.dart';
+import 'services/live_scan_service.dart';
+import 'services/price_zone_detector.dart';
 import 'services/ocr_service.dart';
 import 'services/price_detector.dart';
 import 'theme/app_theme.dart';
@@ -85,13 +87,39 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
   final ImageProcessor imageProcessor = ImageProcessor();
   final OcrService ocrService = OcrService();
   final PriceDetector priceDetector = PriceDetector();
+  final LiveScanService liveScanService = LiveScanService();
+  final PriceZoneDetector priceZoneDetector = PriceZoneDetector();
 
   bool isCameraReady = false;
+
+  // Guide de cadrage en direct : blocs de texte détectés en continu sur
+  // le flux caméra (avant toute capture), juste pour aider à viser —
+  // n'a AUCUN rôle dans l'extraction du prix elle-même, qui reste
+  // entièrement gérée par le pipeline complet déclenché à la capture.
+  List<LiveTextBlock> liveBlocks = [];
+
+  // Boîte "aimantée" YOLO — overlay purement INFORMATIF pour l'instant :
+  // le rectangle fixe (turquoise) reste la seule source de vérité pour
+  // le découpage réel. On regarde d'abord si la boîte verte suit
+  // fidèlement le prix en conditions réelles avant de s'appuyer dessus.
+  Rect? liveZonePrix;
+
+  // Zoom au pincement : bornes matérielles récupérées après
+  // l'initialisation caméra (cf. _initCamera), _baseZoom capture le
+  // niveau de départ à chaque nouveau geste de pincement.
+  double _minZoom = 1.0;
+  double _maxZoom = 1.0;
+  double _currentZoom = 1.0;
+  double _baseZoom = 1.0;
   bool isProcessing = false;
   bool flashOn = false;
   String detectedText = 'Pointe sur un prix et appuie sur le bouton';
   double total = 0.0;
   List<ScannedProduct> products = [];
+
+  // Miniatures des scans où aucun prix n'a été trouvé — gardées pour
+  // comprendre après coup ce qui a été cadré, plutôt que perdues.
+  final List<String> failedScanThumbnails = [];
   String? lastImagePath;
 
   // Journal de debug qui s'accumule sur toute la session (le plus récent
@@ -184,6 +212,25 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
     return centeredTop.clamp(minTop, maxTop);
   }
 
+  /// Centre du rectangle de scan, en coordonnées 0.0-1.0 relatives à
+  /// l'écran — le format attendu par `setFocusPoint`/`setExposurePoint`.
+  /// Mesure la position RÉELLE du rectangle (comme CropService le fait
+  /// déjà pour le découpage), pas une supposition.
+  Offset? _scanBoxNormalizedCenter() {
+    final context = _scanBoxKey.currentContext;
+    if (context == null) return null;
+    final renderObject = context.findRenderObject();
+    if (renderObject is! RenderBox || !renderObject.hasSize) return null;
+
+    final topLeft = renderObject.localToGlobal(Offset.zero);
+    final size = renderObject.size;
+    final screenSize = MediaQuery.of(context).size;
+
+    final centerX = (topLeft.dx + size.width / 2) / screenSize.width;
+    final centerY = (topLeft.dy + size.height / 2) / screenSize.height;
+    return Offset(centerX.clamp(0.0, 1.0), centerY.clamp(0.0, 1.0));
+  }
+
   @override
   void initState() {
     super.initState();
@@ -218,9 +265,94 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
       setState(() => detectedText = 'Permission refusée');
       return;
     }
-    await cameraService.initialize(cameras);
+
+    // Juste après un lancement à froid, Android considère parfois l'app
+    // comme "pas encore vraiment au premier plan" au moment précis où on
+    // essaie d'ouvrir la caméra, et refuse (CAMERA_DISABLED). Ce n'est
+    // pas une vraie erreur permanente — un court instant plus tard, ça
+    // passe. On réessaie donc quelques fois avant d'abandonner pour de
+    // bon, plutôt que de laisser l'utilisatrice bloquée indéfiniment sur
+    // "Initialisation de la caméra...".
+    const maxAttempts = 4;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await cameraService.initialize(cameras);
+        break; // succès, on sort de la boucle de tentatives
+      } catch (e) {
+        // ignore: avoid_print
+        print('[Camera] Tentative $attempt/$maxAttempts échouée : $e');
+        if (attempt == maxAttempts) {
+          if (!mounted) return;
+          setState(() => detectedText =
+              'Impossible d\'ouvrir la caméra — ferme et relance l\'app.');
+          return;
+        }
+        await Future.delayed(Duration(milliseconds: 400 * attempt));
+      }
+    }
     if (!mounted) return;
-    setState(() => isCameraReady = true);
+
+    // Bornes réelles du zoom matériel — varient d'un téléphone à l'autre,
+    // on ne les devine jamais.
+    final minZoom = await cameraService.getMinZoom();
+    final maxZoom = await cameraService.getMaxZoom();
+    if (!mounted) return;
+    // ignore: avoid_print
+    print('[Zoom] Bornes détectées : min=$minZoom, max=$maxZoom');
+
+    // Chargement du modèle YOLO — ne bloque rien si ça échoue (fichier
+    // absent, format inattendu...) : priceZoneDetector.isReady reste
+    // simplement à false, et le reste de l'app continue normalement avec
+    // le rectangle fixe, comme avant.
+    await priceZoneDetector.loadModel();
+    if (!mounted) return;
+
+    setState(() {
+      isCameraReady = true;
+      _minZoom = minZoom;
+      _maxZoom = maxZoom;
+      _currentZoom = minZoom;
+    });
+
+    _startLiveGuide();
+  }
+
+  /// Démarre l'analyse en continu du flux caméra — le guide de cadrage
+  /// en direct. Ne fait QUE dessiner un retour visuel discret pendant que
+  /// l'utilisatrice vise ; n'extrait jamais de prix lui-même.
+  Future<void> _startLiveGuide() async {
+    final camera = cameraService.description;
+    if (camera == null) {
+      // ignore: avoid_print
+      print('[LiveGuide] Impossible de démarrer : description caméra '
+          'introuvable.');
+      return;
+    }
+    // ignore: avoid_print
+    print('[LiveGuide] Démarrage du flux en direct...');
+
+    await cameraService.startImageStream((image) async {
+      final blocks = await liveScanService.analyzeFrame(image, camera);
+      if (!mounted) return;
+      setState(() => liveBlocks = blocks);
+
+      // Détection de zone YOLO — DÉSACTIVÉE TEMPORAIREMENT (surchauffe +
+      // plantage observés). _prepareInput() renvoie encore des données
+      // vides : le modèle tournait donc en continu, à pleine charge,
+      // pour un résultat inexploitable. À réactiver une fois la
+      // conversion d'image terminée. Le service reste chargé
+      // (isReady peut valoir true), seul l'appel est coupé ici.
+      // La conversion d'image est maintenant réellement écrite (voir
+      // price_zone_detector.dart) — on réactive. Fais un premier test
+      // COURT (quelques secondes, pas une longue session) pour vérifier
+      // que la chaleur reste raisonnable avant de t'en servir longtemps.
+      const yoloLiveDetectionEnabled = true;
+      if (yoloLiveDetectionEnabled && priceZoneDetector.isReady) {
+        final zone = await priceZoneDetector.detectZone(image, camera);
+        if (!mounted) return;
+        setState(() => liveZonePrix = zone);
+      }
+    });
   }
 
   Future<void> _toggleFlash() async {
@@ -236,7 +368,29 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
     setState(() {
       isProcessing = true;
       detectedText = 'Scan en cours...';
+      liveBlocks = []; // efface le guide pendant la vraie capture
     });
+
+    // Le flux en direct est suspendu le temps de la capture — certains
+    // téléphones gèrent mal streaming + vraie photo simultanément.
+    await cameraService.stopImageStream();
+
+    // Force la mise au point (et l'exposition) exactement sur le centre
+    // du rectangle bleu, plutôt que de laisser l'autofocus général
+    // décider tout seul — c'est ce qui causait le flou aléatoire ("1 fois
+    // sur 5") : la caméra ne visait pas spécifiquement le prix.
+    final focusPoint = _scanBoxNormalizedCenter();
+    if (focusPoint != null) {
+      // ignore: avoid_print
+      print('[Focus] Mise au point ciblée sur '
+          '(${focusPoint.dx.toStringAsFixed(2)}, '
+          '${focusPoint.dy.toStringAsFixed(2)})');
+      await cameraService.focusOn(focusPoint);
+    } else {
+      // ignore: avoid_print
+      print('[Focus] Impossible de localiser le rectangle — '
+          'mise au point générale conservée.');
+    }
 
     try {
       // 1. Photo HD.
@@ -322,6 +476,11 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
           detectedText = isTooDark
               ? "💡 Zone sombre — essaie d'activer le flash"
               : 'Prix non détecté — réessaie';
+          // On garde la photo même en cas d'échec — utile pour comprendre
+          // après coup ce qui a été cadré (mauvaise zone, texte parasite,
+          // etc.), au lieu de la perdre silencieusement.
+          lastImagePath = thumbnailPath;
+          failedScanThumbnails.insert(0, thumbnailPath);
         });
         if (isTooDark && mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -339,6 +498,7 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
       setState(() => detectedText = 'Erreur : $e');
     }
     setState(() => isProcessing = false);
+    _startLiveGuide();
   }
 
   /// Ajoute effectivement un prix au panier — utilisé aussi bien pour un
@@ -640,7 +800,7 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
                     ),
                   ),
                   Expanded(
-                    child: products.isEmpty
+                    child: products.isEmpty && failedScanThumbnails.isEmpty
                         ? Center(
                             child: Text(
                               'Aucun scan cette session',
@@ -648,69 +808,146 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
                                   AppText.body(color: AppColors.textMuted),
                             ),
                           )
-                        // Grille plutôt que liste : 3 colonnes, bien plus
-                        // dense — on voit d'un coup d'œil beaucoup plus de
-                        // produits qu'avec une ligne par produit. Le
-                        // scrollController vient du DraggableScrollableSheet
-                        // : plus de conflit avec le geste de fermeture.
-                        : GridView.builder(
+                        : ListView(
                             controller: scrollController,
                             padding: const EdgeInsets.all(12),
-                            gridDelegate:
-                                const SliverGridDelegateWithFixedCrossAxisCount(
-                              crossAxisCount: 3,
-                              crossAxisSpacing: 10,
-                              mainAxisSpacing: 10,
-                              childAspectRatio: 0.68,
-                            ),
-                            itemCount: products.length,
-                            itemBuilder: (context, index) {
-                              final p = products[index];
-                              return Container(
-                                padding: const EdgeInsets.all(8),
-                                decoration: glassDecoration(radius: 14),
-                                child: Column(
-                                  crossAxisAlignment:
-                                      CrossAxisAlignment.center,
-                                  children: [
-                                    Expanded(
-                                      child: ClipRRect(
-                                        borderRadius:
-                                            BorderRadius.circular(10),
-                                        child: File(p.imagePath).existsSync()
-                                            ? Image.file(
-                                                File(p.imagePath),
-                                                width: double.infinity,
-                                                fit: BoxFit.cover,
-                                              )
-                                            : const Icon(
-                                                Icons.image_outlined,
-                                                color: AppColors.textMuted,
-                                              ),
+                            children: [
+                              if (products.isNotEmpty)
+                                GridView.builder(
+                                  shrinkWrap: true,
+                                  physics:
+                                      const NeverScrollableScrollPhysics(),
+                                  gridDelegate:
+                                      const SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: 3,
+                                    crossAxisSpacing: 10,
+                                    mainAxisSpacing: 10,
+                                    childAspectRatio: 0.68,
+                                  ),
+                                  itemCount: products.length,
+                                  itemBuilder: (context, index) {
+                                    final p = products[index];
+                                    return Container(
+                                      padding: const EdgeInsets.all(8),
+                                      decoration: glassDecoration(radius: 14),
+                                      child: Column(
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.center,
+                                        children: [
+                                          Expanded(
+                                            child: ClipRRect(
+                                              borderRadius:
+                                                  BorderRadius.circular(10),
+                                              child:
+                                                  File(p.imagePath)
+                                                          .existsSync()
+                                                      ? Image.file(
+                                                          File(p.imagePath),
+                                                          width:
+                                                              double.infinity,
+                                                          fit: BoxFit.cover,
+                                                        )
+                                                      : const Icon(
+                                                          Icons
+                                                              .image_outlined,
+                                                          color: AppColors
+                                                              .textMuted,
+                                                        ),
+                                            ),
+                                          ),
+                                          const SizedBox(height: 4),
+                                          Text(
+                                            p.label,
+                                            style: AppText.body(
+                                              size: 11,
+                                              color: AppColors.textMuted,
+                                            ),
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                          const SizedBox(height: 2),
+                                          GradientText(
+                                            '${p.price.toStringAsFixed(2)} €',
+                                            style: AppText.mono(
+                                              size: 14,
+                                              weight: FontWeight.w700,
+                                            ),
+                                          ),
+                                        ],
                                       ),
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      p.label,
-                                      style: AppText.body(
-                                        size: 11,
-                                        color: AppColors.textMuted,
-                                      ),
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    const SizedBox(height: 2),
-                                    GradientText(
-                                      '${p.price.toStringAsFixed(2)} €',
-                                      style: AppText.mono(
-                                        size: 14,
-                                        weight: FontWeight.w700,
-                                      ),
-                                    ),
-                                  ],
+                                    );
+                                  },
                                 ),
-                              );
-                            },
+                              // Scans où aucun prix n'a été trouvé : gardés
+                              // en photo pour comprendre après coup ce qui
+                              // a été cadré (mauvaise zone, texte parasite,
+                              // etc.), séparés visuellement des vrais
+                              // produits pour ne pas les confondre.
+                              if (failedScanThumbnails.isNotEmpty) ...[
+                                Padding(
+                                  padding: const EdgeInsets.fromLTRB(
+                                    4,
+                                    18,
+                                    4,
+                                    8,
+                                  ),
+                                  child: Text(
+                                    'Non détectés '
+                                    '(${failedScanThumbnails.length})',
+                                    style: AppText.body(
+                                      color: AppColors.textMuted,
+                                      size: 13,
+                                    ),
+                                  ),
+                                ),
+                                GridView.builder(
+                                  shrinkWrap: true,
+                                  physics:
+                                      const NeverScrollableScrollPhysics(),
+                                  gridDelegate:
+                                      const SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: 4,
+                                    crossAxisSpacing: 8,
+                                    mainAxisSpacing: 8,
+                                    childAspectRatio: 0.85,
+                                  ),
+                                  itemCount: failedScanThumbnails.length,
+                                  itemBuilder: (context, index) {
+                                    final path = failedScanThumbnails[index];
+                                    return Container(
+                                      padding: const EdgeInsets.all(4),
+                                      decoration: glassDecoration(radius: 12),
+                                      child: Column(
+                                        children: [
+                                          Expanded(
+                                            child: ClipRRect(
+                                              borderRadius:
+                                                  BorderRadius.circular(8),
+                                              child: File(path).existsSync()
+                                                  ? Image.file(
+                                                      File(path),
+                                                      width: double.infinity,
+                                                      fit: BoxFit.cover,
+                                                    )
+                                                  : const Icon(
+                                                      Icons.image_outlined,
+                                                      color:
+                                                          AppColors.textMuted,
+                                                    ),
+                                            ),
+                                          ),
+                                          const SizedBox(height: 2),
+                                          Text(
+                                            '❌',
+                                            style: AppText.body(size: 10),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ],
+                            ],
                           ),
                   ),
                 ],
@@ -915,6 +1152,8 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
     WakelockPlus.disable();
     cameraService.dispose();
     ocrService.dispose();
+    liveScanService.dispose();
+    priceZoneDetector.dispose();
     super.dispose();
   }
 
@@ -950,7 +1189,55 @@ class _LensScreenState extends State<LensScreen> with WidgetsBindingObserver {
     return Scaffold(
       body: Stack(
         children: [
-          CameraPreview(cameraService.controller!),
+          GestureDetector(
+            // Zoom au pincement : deux doigts pour se rapprocher du prix
+            // sans bouger physiquement le téléphone — utile quand le
+            // cadrage fixe capture le mauvais bout de l'étiquette (nom du
+            // produit plutôt que le prix, par exemple).
+            onScaleStart: (_) => _baseZoom = _currentZoom,
+            onScaleUpdate: (details) {
+              final newZoom = (_baseZoom * details.scale)
+                  .clamp(_minZoom, _maxZoom);
+              // ignore: avoid_print
+              print('[Zoom] scale=${details.scale.toStringAsFixed(2)} '
+                  'newZoom=${newZoom.toStringAsFixed(2)} '
+                  'bornes=[$_minZoom, $_maxZoom]');
+              if ((newZoom - _currentZoom).abs() < 0.01) return;
+              setState(() => _currentZoom = newZoom);
+              cameraService.setZoom(newZoom);
+            },
+            child: CameraPreview(cameraService.controller!),
+          ),
+          // Guide de cadrage en direct : contours discrets sur le texte
+          // détecté en continu (blanc = texte quelconque, émeraude = qui
+          // ressemble à un prix). IgnorePointer : ne doit jamais intercepter
+          // les gestes de zoom/tap destinés à la caméra en dessous.
+          if (liveBlocks.isNotEmpty)
+            IgnorePointer(
+              child: CustomPaint(
+                size: Size.infinite,
+                painter: _LiveGuidePainter(
+                  blocks: liveBlocks,
+                  imageSize: cameraService.controller!.value.previewSize ??
+                      const Size(1, 1),
+                ),
+              ),
+            ),
+          // Boîte "aimantée" YOLO — overlay informatif distinct (vert,
+          // plus épais) du guide de texte ci-dessus. Reste purement
+          // visuel pour l'instant : le découpage réel au moment de la
+          // capture continue d'utiliser le rectangle fixe.
+          if (liveZonePrix != null)
+            IgnorePointer(
+              child: CustomPaint(
+                size: Size.infinite,
+                painter: _PriceZonePainter(
+                  zone: liveZonePrix!,
+                  imageSize: cameraService.controller!.value.previewSize ??
+                      const Size(1, 1),
+                ),
+              ),
+            ),
           // Voile graphite dégradé (haut plus sombre, bas plus sombre encore)
           // pour un rendu "fintech premium" plutôt qu'un simple assombrissement.
           Container(
@@ -1316,6 +1603,115 @@ class _GlassIconButton extends StatelessWidget {
 
 /// Dessine les 4 coins néon (dégradé émeraude → cyan) de la zone de scan,
 /// pour un rendu "scanner" haut de gamme plutôt qu'un simple cadre plein.
+/// Dessine des contours discrets autour du texte détecté en direct sur le
+/// flux caméra — un simple guide visuel pendant que l'utilisatrice cadre,
+/// jamais utilisé pour extraire un prix.
+///
+/// Point technique important : `previewSize` (donné par le contrôleur
+/// caméra) est presque toujours exprimé dans l'orientation NATURELLE du
+/// capteur (souvent "paysage", largeur > hauteur) même quand l'app est en
+/// portrait à l'écran. Sans ajustement, les rectangles seraient dessinés
+/// avec largeur/hauteur inversées. Le repère ci-dessous permute les deux
+/// si l'orientation du flux ne correspond visiblement pas à celle de
+/// l'écran — approche courante, mais qui reste le point le plus probable
+/// à ajuster une fois testé sur un vrai téléphone.
+/// Dessine la boîte "aimantée" YOLO — un simple rectangle vert distinct
+/// du guide de texte, pour la comparer visuellement au rectangle fixe
+/// pendant la phase de test. Même logique de mise à l'échelle que
+/// _LiveGuidePainter (voir sa documentation pour le détail du repère
+/// paysage/portrait).
+class _PriceZonePainter extends CustomPainter {
+  final Rect zone;
+  final Size imageSize;
+
+  _PriceZonePainter({required this.zone, required this.imageSize});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bool needsSwap =
+        (imageSize.width > imageSize.height) != (size.width > size.height);
+    final Size effectiveImageSize = needsSwap
+        ? Size(imageSize.height, imageSize.width)
+        : imageSize;
+
+    if (effectiveImageSize.width == 0 || effectiveImageSize.height == 0) {
+      return;
+    }
+
+    final scaleX = size.width / effectiveImageSize.width;
+    final scaleY = size.height / effectiveImageSize.height;
+
+    final rect = Rect.fromLTWH(
+      zone.left * scaleX,
+      zone.top * scaleY,
+      zone.width * scaleX,
+      zone.height * scaleY,
+    );
+
+    final paint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.5
+      ..color = const Color(0xFF00E676); // vert franc, bien distinct
+
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(rect, const Radius.circular(8)),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _PriceZonePainter oldDelegate) =>
+      oldDelegate.zone != zone;
+}
+
+class _LiveGuidePainter extends CustomPainter {
+  final List<LiveTextBlock> blocks;
+  final Size imageSize;
+
+  _LiveGuidePainter({required this.blocks, required this.imageSize});
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bool needsSwap =
+        (imageSize.width > imageSize.height) != (size.width > size.height);
+    final Size effectiveImageSize = needsSwap
+        ? Size(imageSize.height, imageSize.width)
+        : imageSize;
+
+    if (effectiveImageSize.width == 0 || effectiveImageSize.height == 0) {
+      return;
+    }
+
+    final scaleX = size.width / effectiveImageSize.width;
+    final scaleY = size.height / effectiveImageSize.height;
+
+    for (final block in blocks) {
+      final rect = Rect.fromLTWH(
+        block.boundingBox.left * scaleX,
+        block.boundingBox.top * scaleY,
+        block.boundingBox.width * scaleX,
+        block.boundingBox.height * scaleY,
+      );
+
+      final paint = Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1.2
+        ..color = block.looksLikePrice
+            ? AppColors.emerald.withOpacity(0.65)
+            : Colors.white.withOpacity(0.25);
+
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(rect, const Radius.circular(4)),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _LiveGuidePainter oldDelegate) =>
+      oldDelegate.blocks != blocks;
+}
+
 class _ScanCornersPainter extends CustomPainter {
   static const double _cornerLength = 28;
   static const double _strokeWidth = 3.5;
